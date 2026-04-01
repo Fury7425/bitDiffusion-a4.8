@@ -17,11 +17,11 @@ MIN_TOKENS = 32
 
 random.seed(SEED)
 
-# Total target: 580M tokens
+# Resume-friendly target set after completing the first two FineWeb-2 slices:
+# - kor_Hang: done
+# - jpn_Jpan: done
 DATASETS = [
-    {"path": "HuggingFaceFW/fineweb-2", "name": "kor_Hang", "split": "train", "target_tokens": 60_000_000},
-    {"path": "HuggingFaceFW/fineweb-2", "name": "jpn_Jpan", "split": "train", "target_tokens": 60_000_000},
-    {"path": "HuggingFaceFW/fineweb-2", "name": "zho_Hans", "split": "train", "target_tokens": 60_000_000},
+    {"path": "HuggingFaceFW/fineweb-2", "name": "cmn_Hani", "split": "train", "target_tokens": 60_000_000},
     {"path": "HuggingFaceFW/fineweb-2", "name": "spa_Latn", "split": "train", "target_tokens": 40_000_000},
     {"path": "HuggingFaceFW/fineweb-2", "name": "fra_Latn", "split": "train", "target_tokens": 30_000_000},
     {"path": "HuggingFaceFW/fineweb-2", "name": "deu_Latn", "split": "train", "target_tokens": 30_000_000},
@@ -69,7 +69,7 @@ def main():
     print(f"Output train file: {OUT_TRAIN}")
     print(f"Output val file:   {OUT_VAL}")
 
-    with OUT_TRAIN.open("w", encoding="utf-8") as train_f, OUT_VAL.open("w", encoding="utf-8") as val_f:
+    with OUT_TRAIN.open("a", encoding="utf-8") as train_f, OUT_VAL.open("a", encoding="utf-8") as val_f:
         for spec in DATASETS:
             target = spec["target_tokens"]
             written = 0
