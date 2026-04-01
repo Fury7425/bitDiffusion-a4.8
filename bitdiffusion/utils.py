@@ -15,12 +15,30 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger("bitdiffusion")
+
+_MODEL_TOPOLOGY_FIELDS = (
+    "vocab_size",
+    "hidden_dim",
+    "n_layers",
+    "n_heads",
+    "head_dim",
+    "ffn_dim",
+    "max_seq_len",
+    "mask_token_id",
+    "t_embed_dim",
+    "N_think",
+    "think_token_id",
+    "use_moe",
+    "n_experts",
+    "top_k_experts",
+    "moe_layers",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +182,58 @@ class BitStats:
 # Checkpoint save / load
 # ---------------------------------------------------------------------------
 
+def read_checkpoint(path: str, device: str = "cpu") -> Dict[str, Any]:
+    """Load a raw checkpoint dict from disk."""
+    return torch.load(path, map_location=device, weights_only=False)
+
+
+def resolve_checkpoint_model_config(
+    ckpt: Dict[str, Any],
+    fallback_factory: Optional[Callable[[], "ModelConfig"]] = None,
+    moe_layers_override: Optional[str] = None,
+) -> tuple["ModelConfig", bool]:
+    """Resolve ``ModelConfig`` from checkpoint metadata or a legacy fallback."""
+    from .model import ModelConfig
+
+    model_config = ckpt.get("model_config")
+    if model_config:
+        config_data = dict(model_config)
+        if moe_layers_override:
+            config_data["moe_layers"] = moe_layers_override
+        return ModelConfig(**config_data), True
+
+    if fallback_factory is None:
+        raise ValueError(
+            "Checkpoint does not include serialized model_config and no fallback "
+            "configuration was provided."
+        )
+
+    config = fallback_factory()
+    if moe_layers_override:
+        config.moe_layers = moe_layers_override
+    return config, False
+
+
+def validate_model_config_topology(
+    requested: "ModelConfig",
+    checkpoint: "ModelConfig",
+    context: str = "checkpoint",
+) -> None:
+    """Raise if a checkpoint config disagrees with the requested topology."""
+    mismatches = []
+    for field in _MODEL_TOPOLOGY_FIELDS:
+        requested_value = getattr(requested, field)
+        checkpoint_value = getattr(checkpoint, field)
+        if requested_value != checkpoint_value:
+            mismatches.append(
+                f"{field}: requested={requested_value!r}, checkpoint={checkpoint_value!r}"
+            )
+
+    if mismatches:
+        details = "; ".join(mismatches)
+        raise ValueError(f"{context} model_config does not match the requested topology: {details}")
+
+
 def save_checkpoint(
     path: str,
     model: nn.Module,
@@ -192,6 +262,11 @@ def save_checkpoint(
         "step": step,
         "activation_mode": activation_mode,
     }
+    if hasattr(model, "config"):
+        try:
+            ckpt["model_config"] = asdict(model.config)
+        except Exception:
+            logger.warning("Failed to serialize model config into checkpoint metadata")
     if extra:
         ckpt["extra"] = extra
     torch.save(ckpt, path)
@@ -217,7 +292,7 @@ def load_checkpoint(
     Returns:
         Dict with ``step``, ``activation_mode``, and any ``extra`` metadata.
     """
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = read_checkpoint(path, device=device)
     model.load_state_dict(ckpt["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -227,6 +302,7 @@ def load_checkpoint(
     return {
         "step": ckpt.get("step", 0),
         "activation_mode": ckpt.get("activation_mode", "A8"),
+        "model_config": ckpt.get("model_config"),
         "extra": ckpt.get("extra", {}),
     }
 
@@ -321,6 +397,7 @@ def log_expert_utilization(model: nn.Module, step: int) -> Dict[str, float]:
     """
     metrics = {}
     moe_layer_idx = 0
+    max_expert_fraction = 0.0
 
     for name, module in model.named_modules():
         # Check if this is a BitMoEFFN by presence of expert_token_counts buffer
@@ -332,8 +409,10 @@ def log_expert_utilization(model: nn.Module, step: int) -> Dict[str, float]:
 
             # Per-expert load balance
             for e, count in enumerate(token_counts):
+                fraction = float(count / max(total_tokens, 1))
                 metrics[f"moe/expert_{e}_tokens"] = float(count)
-                metrics[f"moe/expert_{e}_fraction"] = float(count / max(total_tokens, 1))
+                metrics[f"moe/expert_{e}_fraction"] = fraction
+                max_expert_fraction = max(max_expert_fraction, fraction)
 
             # Dropout rate
             drop_rate = drop_count / max(total_routed, 1)
@@ -346,10 +425,21 @@ def log_expert_utilization(model: nn.Module, step: int) -> Dict[str, float]:
         # No MoE layers found
         return {}
 
+    metrics["moe/max_expert_fraction"] = max_expert_fraction
+    metrics["moe/overutilized_expert"] = 1.0 if max_expert_fraction > 0.60 else 0.0
+
     logger.info(
         "Expert utilization: %s",
         ", ".join(f"{k}={v:.4f}" for k, v in metrics.items() if "tokens" in k),
     )
+
+    if max_expert_fraction > 0.60:
+        logger.warning(
+            "MoE expert utilization is imbalanced at step %d: max expert fraction %.2f%% exceeds 60%%. "
+            "Consider increasing aux_loss_weight.",
+            step,
+            100.0 * max_expert_fraction,
+        )
 
     return metrics
 

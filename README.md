@@ -1,14 +1,17 @@
 # BitDiffusion a4.8
 
-A masked diffusion language model combining Microsoft's BitNet a4.8 quantization scheme (ternary weights + 4-bit hybrid activations + 3-bit KV cache) with an MDLM-style absorbing-state diffusion objective.
+A masked diffusion language model combining Microsoft's BitNet a4.8 quantization scheme (ternary weights + 4-bit hybrid activations + quantized KV cache) with an MDLM-style absorbing-state diffusion objective.
 
 ## Architecture
 
 - **Weights:** Ternary {−1, 0, +1} via absmean quantization with STE (BitNet b1.58)
 - **Activations:** Hybrid INT4 on attention/FFN inputs; TopK(55%) + INT8 on intermediate states (BitNet a4.8)
-- **KV Cache:** 3-bit (BOS token at 4-bit) for inference; resets each denoising step
+- **KV Cache:** Legacy quantized KV cache for inference; configurable via `kv_cache_bits` and `kv_cache_bos_bits`; resets each denoising step
 - **Objective:** Masked absorbing-state diffusion with cosine noise schedule, per-sample noise levels
 - **Architecture:** Bidirectional transformer encoder with SwiGLU FFN, RoPE, RMSNorm
+
+`HybridKVCache` still exists in-tree for experimentation, but it is not the
+default runtime path in this compatibility-focused release.
 
 ## Two-Stage Activation Training
 
@@ -43,9 +46,12 @@ Place training files in `data/train/` and validation files in `data/val/`.
 
 ### Train
 
+Thinking tokens are enabled by default in the current config (`N_think=64`).
+Set `--N_think 0` if you want to disable the scratchpad path.
+
 ```bash
 python -m bitdiffusion.train \
-    --tokenizer_path gpt2 \
+    --tokenizer_path Qwen/Qwen-tokenizer \
     --train_data "data/train/*.jsonl" \
     --val_data "data/val/*.jsonl" \
     --output_dir checkpoints \
@@ -64,7 +70,7 @@ For a smaller test run:
 
 ```bash
 python -m bitdiffusion.train \
-    --tokenizer_path gpt2 \
+    --tokenizer_path Qwen/Qwen-tokenizer \
     --train_data "data/train/*.jsonl" \
     --max_steps 1000 \
     --hidden_dim 256 \
@@ -79,17 +85,20 @@ python -m bitdiffusion.train \
 ```bash
 python -m bitdiffusion.train \
     --resume_from checkpoints/step_50000.pt \
-    --tokenizer_path gpt2 \
+    --tokenizer_path Qwen/Qwen-tokenizer \
     --train_data "data/train/*.jsonl" \
     --max_steps 100000
 ```
 
 ### Generate Samples
 
+Sampling defaults to the thinking-enabled path when the checkpoint was trained
+with thinking tokens. Use `--no-thinking` only for legacy fallback configs.
+
 ```bash
 python -m bitdiffusion.sample \
     --checkpoint checkpoints/final.pt \
-    --tokenizer gpt2 \
+    --tokenizer Qwen/Qwen-tokenizer \
     --prompt "Once upon a time" \
     --length 128 \
     --steps 20 \
@@ -103,24 +112,54 @@ Batch generation:
 ```bash
 python -m bitdiffusion.sample \
     --checkpoint checkpoints/final.pt \
-    --tokenizer gpt2 \
+    --tokenizer Qwen/Qwen-tokenizer \
     --num_samples 5 \
     --length 64 \
     --steps 30
 ```
+
+### Export Weights
+
+For a portable checkpoint package, export to `safetensors` plus JSON config:
+
+```bash
+python -m bitdiffusion.export \
+    --checkpoint checkpoints/final.pt \
+    --output_dir exports/final \
+    --format safetensors \
+    --tokenizer Qwen/Qwen-tokenizer
+```
+
+This writes:
+
+- `model.safetensors` with the model weights
+- `model_config.json` with the serialized `ModelConfig`
+- `export_metadata.json` with checkpoint/export metadata
+- tokenizer files if `--tokenizer` is provided
+
+`GGUF` is not a drop-in target for this repo. BitDiffusion is a bidirectional
+diffusion transformer, so standard GGUF runtimes like llama.cpp do not know
+how to execute it even if the tensors are repacked into a `.gguf` container.
+Use `safetensors` as the portable format unless you are also building a custom
+runtime/converter for this architecture.
 
 ## File Structure
 
 ```
 bitdiffusion/
 ├── model.py          # BitLinear, BitAttention, BitFFN, BitDiffusionTransformer, ModelConfig
-├── quantization.py   # HybridQuantizer, KVCache, absmean, absmax, TopK, 3-bit pack/unpack
+├── quantization.py   # HybridQuantizer, KVCache, HybridKVCache, absmean, absmax, TopK
 ├── diffusion.py      # CosineSchedule, MaskDiffusionLoss, masking utilities
 ├── data.py           # StreamingJsonlDataset, collator, DataLoader factory
 ├── train.py          # Training loop, TrainConfig, ActivationSchedule, main()
 ├── sample.py         # Denoising sampler, prompt conditioning, nucleus sampling
-├── utils.py          # BitStats, checkpoint save/load, logging, WandB wrapper
-└── requirements.txt
+├── export.py         # Checkpoint export to safetensors / PyTorch
+└── utils.py          # BitStats, checkpoint save/load, logging, WandB wrapper
+
+sample.py             # Thin wrapper for bitdiffusion.sample
+train.py              # Thin wrapper for bitdiffusion.train
+export.py             # Thin wrapper for bitdiffusion.export
+requirements.txt
 ```
 
 ## Key Differences from BitNet b1.58
@@ -129,7 +168,7 @@ bitdiffusion/
 |---|---|---|
 | Activations | fp16/bf16 | INT4 inputs + TopK(55%)+INT8 intermediates |
 | Training | Single stage | Two-stage: A8 → A4 |
-| KV cache | Full precision | 3-bit (BOS at 4-bit) |
+| KV cache | Full precision | Configurable low-bit KV cache (legacy default) |
 | Sparsification | None | TopK 55% on FFN intermediate + attn output |
 | Noise level | Per-batch | Per-sample |
 

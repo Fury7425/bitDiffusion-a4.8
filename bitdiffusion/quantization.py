@@ -12,7 +12,7 @@ Implements:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -320,13 +320,31 @@ def dequantize_kv(packed: torch.Tensor, scale: torch.Tensor, bits: int = 3,
 
 
 @dataclass
-class _CacheEntry:
-    """Internal storage for one layer's K or V cache."""
+class _CompressedChunk:
+    """Internal storage for one compressed K or V chunk."""
+
     packed: torch.Tensor
     scale: torch.Tensor
     bits: int
     orig_last_dim: int
     seq_len: int
+    scheme: str = "absmax"
+
+
+@dataclass
+class _LayerState:
+    """Per-layer cache state."""
+
+    bos_k: Optional[torch.Tensor] = None
+    bos_v: Optional[torch.Tensor] = None
+    recent_k: Optional[torch.Tensor] = None
+    recent_v: Optional[torch.Tensor] = None
+    bulk_k: list[_CompressedChunk] = field(default_factory=list)
+    bulk_v: list[_CompressedChunk] = field(default_factory=list)
+    total_tokens: int = 0
+
+
+_CacheEntry = _CompressedChunk
 
 
 class KVCache:
@@ -441,3 +459,348 @@ class KVCache:
             return torch.cat([bos_k, rest_k], dim=2), torch.cat([bos_v, rest_v], dim=2)
         else:
             return bos_k, bos_v
+
+
+class HybridKVCache:
+    """Adaptive mixed-precision KV cache for masked diffusion inference.
+
+    Routing is fixed per layer:
+    - Early layers ``[0, L//3)`` use absmax 3-bit quantization.
+    - Middle layers ``[L//3, 2L//3)`` use TurboQuant 3-bit.
+    - Late layers ``[2L//3, L)`` use TurboQuant 4-bit.
+
+    Precision exceptions:
+    - BOS (position 0) is always kept in FP16.
+    - The most recent ``recent_window`` tokens are always kept in FP16.
+      When the recent window overflows, the oldest recent tokens are
+      compressed into bulk storage using the layer's assigned strategy.
+
+    This repository uses masked diffusion rather than autoregressive
+    decoding. Each denoising step re-processes the full sequence with a
+    new mask pattern, so the cache must be cleared at the start of every
+    denoising step via ``reset()``.
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        default_bits: int = 3,
+        bos_bits: int = 16,
+        recent_window: int = 64,
+        rotation_seed: int = 0,
+        n_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        lloyd_max_iters: int = 24,
+        lloyd_max_clip: float = 4.0,
+    ):
+        self.n_layers = n_layers
+        self.default_bits = default_bits
+        self.bos_bits = bos_bits
+        self.recent_window = recent_window
+        self.rotation_seed = rotation_seed
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.lloyd_max_iters = lloyd_max_iters
+        self.lloyd_max_clip = lloyd_max_clip
+
+        self._layers = [_LayerState() for _ in range(n_layers)]
+        self._rotation_mats: list[Optional[torch.Tensor]] = [None] * n_layers
+        self._codebooks = {
+            3: self._build_lloyd_max_codebook(3),
+            4: self._build_lloyd_max_codebook(4),
+        }
+
+    def _layer_scheme(self, layer_idx: int) -> Tuple[str, int]:
+        split_1 = self.n_layers // 3
+        split_2 = (2 * self.n_layers) // 3
+        if layer_idx < split_1:
+            return "absmax", 3
+        if layer_idx < split_2:
+            return "turboquant", 3
+        return "turboquant", 4
+
+    def _ensure_runtime_shape(self, n_heads: int, head_dim: int) -> None:
+        if self.n_heads is None:
+            self.n_heads = n_heads
+        elif self.n_heads != n_heads:
+            raise ValueError(f"KV cache expected {self.n_heads} heads, got {n_heads}")
+
+        if self.head_dim is None:
+            self.head_dim = head_dim
+        elif self.head_dim != head_dim:
+            raise ValueError(f"KV cache expected head_dim {self.head_dim}, got {head_dim}")
+
+        if any(mat is None for mat in self._rotation_mats):
+            self._init_rotation_mats()
+
+    def _init_rotation_mats(self) -> None:
+        assert self.n_heads is not None and self.head_dim is not None
+        generator = torch.Generator(device="cpu").manual_seed(self.rotation_seed)
+        mats: list[torch.Tensor] = []
+
+        for _layer_idx in range(self.n_layers):
+            per_head = []
+            for _head_idx in range(self.n_heads):
+                gaussian = torch.randn(
+                    self.head_dim,
+                    self.head_dim,
+                    generator=generator,
+                    dtype=torch.float32,
+                )
+                q, r = torch.linalg.qr(gaussian, mode="reduced")
+                sign = torch.sign(torch.diag(r))
+                sign[sign == 0] = 1.0
+                q = q * sign.unsqueeze(0)
+                per_head.append(q)
+            mats.append(torch.stack(per_head, dim=0))
+
+        self._rotation_mats = mats
+
+    def _build_lloyd_max_codebook(self, bits: int) -> torch.Tensor:
+        levels = 1 << bits
+        try:
+            from scipy.stats import norm
+        except Exception:
+            norm = None
+
+        if norm is None:
+            return torch.linspace(
+                -self.lloyd_max_clip,
+                self.lloyd_max_clip,
+                steps=levels,
+                dtype=torch.float32,
+            )
+
+        eps = 1e-6
+        lower = -self.lloyd_max_clip
+        upper = self.lloyd_max_clip
+        centroids = torch.linspace(-2.5, 2.5, steps=levels, dtype=torch.float64)
+
+        for _ in range(self.lloyd_max_iters):
+            bounds = torch.empty(levels + 1, dtype=torch.float64)
+            bounds[0] = lower
+            bounds[-1] = upper
+            bounds[1:-1] = 0.5 * (centroids[:-1] + centroids[1:])
+
+            updated = []
+            for idx in range(levels):
+                a = float(bounds[idx])
+                b = float(bounds[idx + 1])
+                denom = norm.cdf(b) - norm.cdf(a)
+                if denom < eps:
+                    updated.append(float(centroids[idx]))
+                    continue
+                mean = (norm.pdf(a) - norm.pdf(b)) / max(denom, eps)
+                updated.append(min(max(mean, lower), upper))
+            centroids = torch.tensor(updated, dtype=torch.float64)
+
+        return centroids.to(torch.float32)
+
+    def _pack_indices(self, values: torch.Tensor, bits: int) -> Tuple[torch.Tensor, int]:
+        orig_last_dim = values.shape[-1]
+        if orig_last_dim % 2 != 0:
+            values = F.pad(values, (0, 1))
+
+        if bits == 3:
+            return _pack_3bit(values.to(torch.uint8)), orig_last_dim
+        if bits == 4:
+            return _pack_4bit(values.to(torch.uint8)), orig_last_dim
+        raise ValueError(f"Unsupported pack bits: {bits}")
+
+    def _unpack_indices(self, packed: torch.Tensor, bits: int, orig_last_dim: int) -> torch.Tensor:
+        padded_dim = packed.shape[-1] * 2
+        if bits == 3:
+            return _unpack_3bit(packed, padded_dim)[..., :orig_last_dim]
+        if bits == 4:
+            return _unpack_4bit(packed, padded_dim)[..., :orig_last_dim]
+        raise ValueError(f"Unsupported unpack bits: {bits}")
+
+    def _absmax_compress(self, tensor: torch.Tensor) -> _CompressedChunk:
+        scale = tensor.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 3.0
+        values = (tensor.float() / scale).round().clamp(-3, 3) + 3.0
+        packed, orig_last_dim = self._pack_indices(values, bits=3)
+        return _CompressedChunk(
+            packed=packed,
+            scale=scale.to(torch.float32),
+            bits=3,
+            orig_last_dim=orig_last_dim,
+            seq_len=tensor.shape[2],
+            scheme="absmax",
+        )
+
+    def _absmax_decompress(self, chunk: _CompressedChunk) -> torch.Tensor:
+        values = self._unpack_indices(chunk.packed, bits=3, orig_last_dim=chunk.orig_last_dim).float()
+        return (values - 3.0) * chunk.scale.to(device=chunk.packed.device, dtype=torch.float32)
+
+    def _get_rotation(self, layer_idx: int, device: torch.device) -> torch.Tensor:
+        rotation = self._rotation_mats[layer_idx]
+        if rotation is None:
+            raise RuntimeError("Rotation matrices are not initialized")
+        return rotation.to(device=device, dtype=torch.float32)
+
+    def _turboquant_compress(self, layer_idx: int, tensor: torch.Tensor, bits: int) -> _CompressedChunk:
+        codebook = self._codebooks[bits].to(device=tensor.device, dtype=torch.float32)
+        rotation = self._get_rotation(layer_idx, tensor.device)
+
+        rotated = torch.einsum("bhtd,hde->bhte", tensor.float(), rotation)
+        scale = rotated.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        normalized = (rotated / scale).clamp(codebook[0].item(), codebook[-1].item())
+        distances = (normalized.unsqueeze(-1) - codebook.view(1, 1, 1, 1, -1)).abs()
+        indices = distances.argmin(dim=-1).to(torch.uint8)
+        packed, orig_last_dim = self._pack_indices(indices, bits=bits)
+
+        return _CompressedChunk(
+            packed=packed,
+            scale=scale.to(torch.float32),
+            bits=bits,
+            orig_last_dim=orig_last_dim,
+            seq_len=tensor.shape[2],
+            scheme="turboquant",
+        )
+
+    def _turboquant_decompress(self, layer_idx: int, chunk: _CompressedChunk) -> torch.Tensor:
+        codebook = self._codebooks[chunk.bits].to(device=chunk.packed.device, dtype=torch.float32)
+        rotation = self._get_rotation(layer_idx, chunk.packed.device)
+        indices = self._unpack_indices(chunk.packed, bits=chunk.bits, orig_last_dim=chunk.orig_last_dim).long()
+        rotated = codebook[indices] * chunk.scale.to(device=chunk.packed.device, dtype=torch.float32)
+        return torch.einsum("bhte,hed->bhtd", rotated, rotation.transpose(-1, -2))
+
+    def _compress_chunk(self, layer_idx: int, tensor: torch.Tensor) -> _CompressedChunk:
+        scheme, bits = self._layer_scheme(layer_idx)
+        if scheme == "absmax":
+            return self._absmax_compress(tensor)
+        return self._turboquant_compress(layer_idx, tensor, bits=bits)
+
+    def _decompress_chunks(self, layer_idx: int, chunks: list[_CompressedChunk]) -> Optional[torch.Tensor]:
+        if not chunks:
+            return None
+
+        out = []
+        for chunk in chunks:
+            if chunk.scheme == "absmax":
+                out.append(self._absmax_decompress(chunk))
+            else:
+                out.append(self._turboquant_decompress(layer_idx, chunk))
+        return torch.cat(out, dim=2)
+
+    def reset(self) -> None:
+        """Clear all cached entries. Call at the start of each denoising step."""
+        self._layers = [_LayerState() for _ in range(self.n_layers)]
+
+    def append(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Store one K/V token with shape ``(B, n_heads, 1, head_dim)``."""
+        if k.shape != v.shape:
+            raise ValueError(f"K/V shape mismatch: {k.shape} vs {v.shape}")
+        if k.ndim != 4 or k.shape[2] != 1:
+            raise ValueError(f"append expects (B, n_heads, 1, head_dim), got {tuple(k.shape)}")
+
+        self._ensure_runtime_shape(n_heads=k.shape[1], head_dim=k.shape[-1])
+        state = self._layers[layer_idx]
+        token_k = k.detach().to(torch.float16)
+        token_v = v.detach().to(torch.float16)
+
+        if state.total_tokens == 0:
+            state.bos_k = token_k
+            state.bos_v = token_v
+            state.total_tokens = 1
+            return
+
+        if state.recent_k is None:
+            state.recent_k = token_k
+            state.recent_v = token_v
+        else:
+            state.recent_k = torch.cat([state.recent_k, token_k], dim=2)
+            state.recent_v = torch.cat([state.recent_v, token_v], dim=2)
+
+        if state.recent_k.shape[2] > self.recent_window:
+            overflow = state.recent_k.shape[2] - self.recent_window
+            old_k = state.recent_k[:, :, :overflow, :].to(torch.float32)
+            old_v = state.recent_v[:, :, :overflow, :].to(torch.float32)
+            state.bulk_k.append(self._compress_chunk(layer_idx, old_k))
+            state.bulk_v.append(self._compress_chunk(layer_idx, old_v))
+            state.recent_k = state.recent_k[:, :, overflow:, :].contiguous()
+            state.recent_v = state.recent_v[:, :, overflow:, :].contiguous()
+
+        state.total_tokens += 1
+
+    def get(self, layer_idx: int, target_shape: Optional[Tuple[int, ...]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Retrieve all K/V for a layer and return tensors in FP32."""
+        state = self._layers[layer_idx]
+        if state.total_tokens == 0:
+            if target_shape is None:
+                raise ValueError("target_shape is required when retrieving an empty cache")
+            return (
+                torch.zeros(target_shape, dtype=torch.float32),
+                torch.zeros(target_shape, dtype=torch.float32),
+            )
+
+        parts_k = [state.bos_k.to(torch.float32)] if state.bos_k is not None else []
+        parts_v = [state.bos_v.to(torch.float32)] if state.bos_v is not None else []
+
+        bulk_k = self._decompress_chunks(layer_idx, state.bulk_k)
+        bulk_v = self._decompress_chunks(layer_idx, state.bulk_v)
+        if bulk_k is not None:
+            parts_k.append(bulk_k)
+            parts_v.append(bulk_v)
+
+        if state.recent_k is not None:
+            parts_k.append(state.recent_k.to(torch.float32))
+            parts_v.append(state.recent_v.to(torch.float32))
+
+        k_full = torch.cat(parts_k, dim=2)
+        v_full = torch.cat(parts_v, dim=2)
+
+        if target_shape is not None:
+            if k_full.shape[:2] != target_shape[:2] or k_full.shape[-1] != target_shape[-1]:
+                raise ValueError(
+                    f"Retrieved cache shape {tuple(k_full.shape)} is incompatible with target {tuple(target_shape)}"
+                )
+            if k_full.shape[2] != target_shape[2]:
+                raise ValueError(
+                    f"Retrieved cache sequence length {k_full.shape[2]} does not match target {target_shape[2]}"
+                )
+
+        return k_full, v_full
+
+    def update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compatibility wrapper for the existing attention code path."""
+        if k.shape != v.shape:
+            raise ValueError(f"K/V shape mismatch: {k.shape} vs {v.shape}")
+        if k.ndim != 4:
+            raise ValueError(f"update expects rank-4 tensors, got {tuple(k.shape)}")
+
+        for token_idx in range(k.shape[2]):
+            self.append(
+                layer_idx,
+                k[:, :, token_idx:token_idx + 1, :],
+                v[:, :, token_idx:token_idx + 1, :],
+            )
+
+        return self.get(
+            layer_idx,
+            target_shape=(k.shape[0], k.shape[1], self._layers[layer_idx].total_tokens, k.shape[-1]),
+        )
+
+    def effective_bits(self) -> float:
+        """Estimate effective bits per stored scalar value."""
+        total_bits = 0.0
+        total_values = 0
+
+        for state in self._layers:
+            if state.bos_k is not None:
+                bos_values = state.bos_k.numel() + state.bos_v.numel()
+                total_values += bos_values
+                total_bits += 16.0 * bos_values
+
+            if state.recent_k is not None:
+                recent_values = state.recent_k.numel() + state.recent_v.numel()
+                total_values += recent_values
+                total_bits += 16.0 * recent_values
+
+            for chunk in state.bulk_k + state.bulk_v:
+                chunk_values = chunk.seq_len * chunk.scale.shape[0] * chunk.scale.shape[1] * chunk.orig_last_dim
+                total_values += chunk_values
+                total_bits += chunk.packed.numel() * chunk.packed.element_size() * 8
+                total_bits += chunk.scale.numel() * chunk.scale.element_size() * 8
+
+        return total_bits / max(total_values, 1)

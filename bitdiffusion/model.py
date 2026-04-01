@@ -68,14 +68,14 @@ class ModelConfig:
 
     # --- Thinking tokens ---
     think_token_id: int = 0   # set automatically in __post_init__ if 0
-    N_think: int = 0          # number of thinking token positions (0 = disabled)
+    N_think: int = 64         # number of thinking token positions (0 = disabled)
     think_prob: float = 0.5   # probability of including thinking prefix during training
 
     # --- Mixture of Experts ---
     use_moe: bool = False
     n_experts: int = 8
     top_k_experts: int = 2
-    moe_layers: str = "alternate"  # "all", "alternate", "top_half"
+    moe_layers: str = "alternate"  # "all", "alternate", "alternate_even", "top_half"
     aux_loss_weight: float = 0.01
     expert_capacity_factor: float = 1.25
 
@@ -103,6 +103,8 @@ class ModelConfig:
             return True
         elif self.moe_layers == "alternate":
             return layer_idx % 2 == 1
+        elif self.moe_layers == "alternate_even":
+            return layer_idx % 2 == 0
         elif self.moe_layers == "top_half":
             return layer_idx >= self.n_layers // 2
         return False
@@ -467,6 +469,9 @@ class Int8Linear(nn.Module):
 
     def extra_repr(self) -> str:
         return f"in_features={self.in_features}, out_features={self.out_features}, quant=int8"
+
+
+Int8Router = Int8Linear
 
 
 # ---------------------------------------------------------------------------
