@@ -254,7 +254,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(full_k.shape, k.shape)
         self.assertEqual(full_v.shape, v.shape)
         self.assertEqual(cache._k_bos[0].bits, 8)
-        self.assertEqual(cache._k[0].bits, 4)
+        self.assertEqual(cache._k_chunks[0][0].bits, 4)
 
         next_k = torch.randn(1, 2, 1, 5)
         next_v = torch.randn(1, 2, 1, 5)

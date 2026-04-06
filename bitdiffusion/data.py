@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from typing import Dict, Iterator, List, Optional
 
 import torch
@@ -40,12 +41,14 @@ class StreamingJsonlDataset(IterableDataset):
         tokenizer,
         max_length: int = 512,
         mask_token_id: Optional[int] = None,
+        shuffle_buffer_size: int = 8192,
     ):
         super().__init__()
         self.paths = sorted(paths)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.mask_token_id = mask_token_id
+        self.shuffle_buffer_size = shuffle_buffer_size
 
     def _iter_files(self, file_paths: List[str]) -> Iterator[Dict]:
         """Yield raw JSON dicts from the given file paths."""
@@ -68,31 +71,53 @@ class StreamingJsonlDataset(IterableDataset):
         # Shard files across workers
         return [p for i, p in enumerate(self.paths) if i % worker_info.num_workers == worker_info.id]
 
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        """Yield tokenized chunks as dicts with ``input_ids`` tensor.
-
-        Documents longer than ``max_length`` are split into non-overlapping
-        chunks. Remaining tokens shorter than 16 are discarded to avoid
-        very short sequences.
-        """
-        files = self._shard_files()
-        buffer: List[int] = []
+    def _produce_chunks(self, files: List[str]) -> Iterator[Dict[str, torch.Tensor]]:
+        """Tokenize and chunk documents into fixed-length sequences."""
+        token_buf: List[int] = []
 
         for doc in self._iter_files(files):
             text = doc.get("text", "")
             if not text:
                 continue
             ids = self.tokenizer.encode(text, add_special_tokens=False)
-            buffer.extend(ids)
+            token_buf.extend(ids)
 
-            while len(buffer) >= self.max_length:
-                chunk = buffer[: self.max_length]
-                buffer = buffer[self.max_length :]
+            while len(token_buf) >= self.max_length:
+                chunk = token_buf[: self.max_length]
+                token_buf = token_buf[self.max_length :]
                 yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
 
         # Emit final partial chunk if reasonably sized
-        if len(buffer) >= 16:
-            yield {"input_ids": torch.tensor(buffer[: self.max_length], dtype=torch.long)}
+        if len(token_buf) >= 16:
+            yield {"input_ids": torch.tensor(token_buf[: self.max_length], dtype=torch.long)}
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """Yield tokenized chunks with an in-memory shuffle buffer.
+
+        Documents longer than ``max_length`` are split into non-overlapping
+        chunks. A shuffle buffer of ``shuffle_buffer_size`` examples is
+        maintained to break sequential ordering and improve training
+        dynamics. Remaining tokens shorter than 16 are discarded.
+        """
+        files = self._shard_files()
+
+        if self.shuffle_buffer_size <= 1:
+            yield from self._produce_chunks(files)
+            return
+
+        buf: List[Dict[str, torch.Tensor]] = []
+        rng = random.Random()
+
+        for example in self._produce_chunks(files):
+            buf.append(example)
+            if len(buf) >= self.shuffle_buffer_size:
+                idx = rng.randrange(len(buf))
+                buf[idx], buf[-1] = buf[-1], buf[idx]
+                yield buf.pop()
+
+        # Drain remaining buffer in shuffled order
+        rng.shuffle(buf)
+        yield from buf
 
 
 def collate_fn(
@@ -131,6 +156,7 @@ def make_dataloader(
     num_workers: int = 2,
     mask_token_id: Optional[int] = None,
     pad_token_id: int = 0,
+    shuffle_buffer_size: int = 8192,
 ) -> DataLoader:
     """Create a streaming DataLoader from JSONL files.
 
@@ -142,6 +168,7 @@ def make_dataloader(
         num_workers: Number of DataLoader workers.
         mask_token_id: Absorbing-state token ID.
         pad_token_id: Padding token ID.
+        shuffle_buffer_size: Number of examples to buffer for shuffling.
 
     Returns:
         A PyTorch DataLoader yielding padded batches.
@@ -151,6 +178,7 @@ def make_dataloader(
         tokenizer=tokenizer,
         max_length=max_length,
         mask_token_id=mask_token_id,
+        shuffle_buffer_size=shuffle_buffer_size,
     )
     return DataLoader(
         dataset,

@@ -204,14 +204,20 @@ def denoise(
         # Identify currently masked positions (excluding frozen prefix)
         is_masked = (ids == mask_token_id)
 
-        # Sample at masked positions
-        for b in range(num_samples):
-            masked_pos = is_masked[b].nonzero(as_tuple=True)[0]
-            if masked_pos.numel() == 0:
-                continue
-            pos_logits = logits[b, masked_pos, :vocab_size]  # exclude mask token logit
-            sampled = nucleus_sample(pos_logits, temperature, top_p, generator=gen)
-            ids[b, masked_pos] = sampled
+        # Sample at all masked positions (batched)
+        if is_masked.any():
+            masked_logits = logits[:, :, :vocab_size]  # (B, T, V) exclude mask token
+            masked_logits = masked_logits / max(temperature, 1e-8)
+            if top_p < 1.0:
+                sorted_logits, sorted_idx = masked_logits.sort(dim=-1, descending=True)
+                cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                remove_mask = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
+                sorted_logits[remove_mask] = -float("inf")
+                masked_logits = torch.zeros_like(masked_logits).scatter(-1, sorted_idx, sorted_logits)
+            probs = F.softmax(masked_logits, dim=-1)
+            flat_probs = probs.view(-1, probs.shape[-1])
+            sampled = torch.multinomial(flat_probs, 1, generator=gen).view(num_samples, total_len)
+            ids = torch.where(is_masked, sampled, ids)
 
         # Re-mask positions that should still be uncertain at t_next
         if t_next > 0:
@@ -370,15 +376,16 @@ class ThinkingDiffusionSampler:
             t_input = t_curr.expand(num_samples)
             logits, _ = self.model(ids, t_input, kv_cache=kv_cache)
 
-            # Only sample at thinking positions that are masked
-            for b in range(num_samples):
-                think_mask = (ids[b, think_start:think_end] == mask_token_id)
-                masked_pos = think_mask.nonzero(as_tuple=True)[0] + think_start
-                if masked_pos.numel() == 0:
-                    continue
-                pos_logits = logits[b, masked_pos, :vocab_size]
-                sampled = nucleus_sample(pos_logits, self.temperature, self.top_p, generator=gen)
-                ids[b, masked_pos] = sampled
+            # Sample at thinking positions that are masked (batched)
+            think_is_masked = (ids[:, think_start:think_end] == mask_token_id)  # (B, n_think)
+            if think_is_masked.any():
+                think_logits = logits[:, think_start:think_end, :vocab_size]
+                sampled = nucleus_sample(
+                    think_logits.reshape(-1, vocab_size), self.temperature, self.top_p, generator=gen,
+                ).view(num_samples, self.n_think)
+                ids[:, think_start:think_end] = torch.where(
+                    think_is_masked, sampled, ids[:, think_start:think_end],
+                )
 
             # Re-mask thinking positions for next step
             if t_next > 0:
@@ -417,15 +424,17 @@ class ThinkingDiffusionSampler:
             t_input = t_curr.expand(num_samples)
             logits, _ = self.model(ids, t_input, kv_cache=kv_cache)
 
-            # Only sample at answer positions that are masked
-            for b in range(num_samples):
-                answer_mask = (ids[b, answer_start:] == mask_token_id)
-                masked_pos = answer_mask.nonzero(as_tuple=True)[0] + answer_start
-                if masked_pos.numel() == 0:
-                    continue
-                pos_logits = logits[b, masked_pos, :vocab_size]
-                sampled = nucleus_sample(pos_logits, self.temperature, self.top_p, generator=gen)
-                ids[b, masked_pos] = sampled
+            # Sample at answer positions that are masked (batched)
+            answer_is_masked = (ids[:, answer_start:] == mask_token_id)  # (B, answer_len)
+            if answer_is_masked.any():
+                answer_logits = logits[:, answer_start:, :vocab_size]
+                n_answer = total_len - answer_start
+                sampled = nucleus_sample(
+                    answer_logits.reshape(-1, vocab_size), self.temperature, self.top_p, generator=gen,
+                ).view(num_samples, n_answer)
+                ids[:, answer_start:] = torch.where(
+                    answer_is_masked, sampled, ids[:, answer_start:],
+                )
 
             # Re-mask answer positions for next step
             if t_next > 0:
@@ -456,6 +465,284 @@ class ThinkingDiffusionSampler:
             think_text = self.tokenizer.decode(think_ids.tolist(), skip_special_tokens=True)
             answer_text = self.tokenizer.decode(answer_ids.tolist(), skip_special_tokens=True)
             results.append({"thinking": think_text, "answer": answer_text})
+
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Block Diffusion Sampler — semi-autoregressive with quantized KV cache
+# ---------------------------------------------------------------------------
+
+class BlockDiffusionSampler:
+    """Semi-autoregressive block diffusion sampler.
+
+    Generates text in fixed-size blocks, left to right. Each block is
+    denoised via the full MDLM diffusion schedule (bidirectional attention
+    within the block). Previously committed blocks are read through the
+    quantized KV cache, giving correct left-to-right coherence across
+    blocks without recomputing their K/V.
+
+    This makes the quantized KV cache effective: committed context
+    accumulates in 3-bit storage and is never re-masked or recomputed.
+
+    Optionally prepends per-block thinking tokens as a planning scratchpad
+    before each block is generated.
+
+    Args:
+        model: Trained BitDiffusionTransformer.
+        tokenizer: HuggingFace-compatible tokenizer.
+        block_size: Number of tokens per block.
+        steps: Denoising steps per block.
+        think_tokens: Number of thinking token positions per block (0=disabled).
+        think_steps: Denoising steps for the thinking phase.
+        temperature: Sampling temperature.
+        top_p: Nucleus sampling threshold.
+        verbose: Print intermediate results.
+        seed: Random seed.
+        device: Torch device.
+    """
+
+    def __init__(
+        self,
+        model: BitDiffusionTransformer,
+        tokenizer,
+        block_size: int = 256,
+        steps: int = 20,
+        think_tokens: int = 0,
+        think_steps: int = 10,
+        temperature: float = 0.9,
+        top_p: float = 0.95,
+        verbose: bool = False,
+        seed: int = 42,
+        device: torch.device = torch.device("cpu"),
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.steps = steps
+        self.think_tokens = think_tokens
+        self.think_steps = think_steps
+        self.temperature = temperature
+        self.top_p = top_p
+        self.verbose = verbose
+        self.seed = seed
+        self.device = device
+
+    def _sample_masked(
+        self,
+        logits: torch.Tensor,
+        is_masked: torch.Tensor,
+        ids: torch.Tensor,
+        gen: torch.Generator,
+    ) -> torch.Tensor:
+        """Sample at masked positions using nucleus sampling (batched)."""
+        vocab_size = self.model.config.vocab_size
+        if not is_masked.any():
+            return ids
+        masked_logits = logits[:, :, :vocab_size] / max(self.temperature, 1e-8)
+        if self.top_p < 1.0:
+            sorted_logits, sorted_idx = masked_logits.sort(dim=-1, descending=True)
+            cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            remove = cumprobs - sorted_logits.softmax(dim=-1) >= self.top_p
+            sorted_logits[remove] = -float("inf")
+            masked_logits = torch.zeros_like(masked_logits).scatter(-1, sorted_idx, sorted_logits)
+        probs = F.softmax(masked_logits, dim=-1)
+        B, T, V = probs.shape
+        sampled = torch.multinomial(probs.view(-1, V), 1, generator=gen).view(B, T)
+        return torch.where(is_masked, sampled, ids)
+
+    def _denoise_block(
+        self,
+        block_ids: torch.Tensor,
+        kv_cache: "KVCache",
+        rope_offset: int,
+        n_steps: int,
+        gen: torch.Generator,
+    ) -> torch.Tensor:
+        """Run the diffusion denoising schedule on a single block.
+
+        The KV cache is set to ephemeral mode: committed context K/V are
+        read from cache, current block K/V are computed fresh each step
+        but not stored.
+
+        Args:
+            block_ids: (B, block_len) token IDs (initially masked).
+            kv_cache: KVCache with committed context.
+            rope_offset: Absolute position offset for this block.
+            n_steps: Number of denoising steps.
+            gen: Random generator.
+
+        Returns:
+            (B, block_len) denoised token IDs.
+        """
+        schedule = CosineSchedule()
+        mask_token_id = self.model.config.mask_token_id
+        B, block_len = block_ids.shape
+
+        t_steps = torch.linspace(1.0, 0.0, n_steps + 1, device=self.device)
+
+        kv_cache.ephemeral = True
+        for step_idx in range(n_steps):
+            t_curr = t_steps[step_idx]
+            t_next = t_steps[step_idx + 1]
+
+            t_input = t_curr.expand(B)
+            logits, _ = self.model(block_ids, t_input, kv_cache=kv_cache, rope_offset=rope_offset)
+
+            is_masked = (block_ids == mask_token_id)
+            block_ids = self._sample_masked(logits, is_masked, block_ids, gen)
+
+            # Re-mask positions for next step
+            if t_next > 0:
+                mask_prob = schedule.mask_prob(t_next)
+                rand = torch.rand(B, block_len, device=self.device, generator=gen)
+                should_remask = rand < mask_prob
+                block_ids = torch.where(should_remask & is_masked, mask_token_id, block_ids)
+
+            if self.verbose:
+                n_masked = (block_ids == mask_token_id).sum().item()
+                preview = self.tokenizer.decode(
+                    block_ids[0].clamp(0, self.model.config.vocab_size - 1).tolist(),
+                    skip_special_tokens=True,
+                )
+                logger.info(
+                    "  step %d/%d (t=%.3f→%.3f, masked=%d): %s",
+                    step_idx + 1, n_steps, t_curr.item(), t_next.item(), n_masked, preview[:120],
+                )
+
+        kv_cache.ephemeral = False
+        return block_ids
+
+    def _commit_block(
+        self,
+        block_ids: torch.Tensor,
+        kv_cache: "KVCache",
+        rope_offset: int,
+    ) -> None:
+        """Forward a committed block at t=0 and store its K/V in the cache.
+
+        Args:
+            block_ids: (B, block_len) fully denoised token IDs.
+            kv_cache: KVCache to store into (normal mode).
+            rope_offset: Absolute position offset for this block.
+        """
+        B = block_ids.shape[0]
+        t_zero = torch.zeros(B, device=self.device)
+        kv_cache.ephemeral = False
+        with torch.no_grad():
+            self.model(block_ids, t_zero, kv_cache=kv_cache, rope_offset=rope_offset)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: str = "",
+        gen_length: int = 512,
+        num_samples: int = 1,
+    ) -> list[dict[str, str]]:
+        """Generate text using block-wise diffusion with quantized KV cache.
+
+        Args:
+            prompt: Optional conditioning prompt prefix.
+            gen_length: Total answer tokens to generate.
+            num_samples: Number of independent samples.
+
+        Returns:
+            List of dicts with ``"text"`` and optionally ``"blocks"`` keys.
+        """
+        self.model.eval()
+        config = self.model.config
+        mask_token_id = config.mask_token_id
+        vocab_size = config.vocab_size
+
+        gen = torch.Generator(device=self.device).manual_seed(self.seed)
+
+        # Tokenize prompt
+        if prompt:
+            prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        else:
+            prompt_ids = []
+        prefix_len = len(prompt_ids)
+
+        # Create KV cache
+        kv_cache = KVCache(
+            n_layers=config.n_layers,
+            default_bits=config.kv_cache_bits,
+            bos_bits=config.kv_cache_bos_bits,
+        )
+
+        # Commit prompt to cache at t=0 (if present)
+        if prefix_len > 0:
+            prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
+            prompt_batch = prompt_tensor.unsqueeze(0).expand(num_samples, -1)
+            self._commit_block(prompt_batch, kv_cache, rope_offset=0)
+
+        # Divide generation into blocks
+        n_blocks = max(1, (gen_length + self.block_size - 1) // self.block_size)
+        all_generated = []
+        block_texts = []
+        current_offset = prefix_len
+
+        for block_idx in range(n_blocks):
+            remaining = gen_length - len(all_generated)
+            this_block_size = min(self.block_size, remaining)
+            if this_block_size <= 0:
+                break
+
+            if self.verbose:
+                logger.info(
+                    "=== Block %d/%d (offset=%d, size=%d) ===",
+                    block_idx + 1, n_blocks, current_offset, this_block_size,
+                )
+
+            # --- Per-block thinking phase (optional) ---
+            if self.think_tokens > 0:
+                if self.verbose:
+                    logger.info("  [thinking phase: %d tokens, %d steps]", self.think_tokens, self.think_steps)
+                think_ids = torch.full(
+                    (num_samples, self.think_tokens), mask_token_id,
+                    dtype=torch.long, device=self.device,
+                )
+                think_ids = self._denoise_block(
+                    think_ids, kv_cache, rope_offset=current_offset,
+                    n_steps=self.think_steps, gen=gen,
+                )
+                # Commit thinking tokens to cache
+                self._commit_block(think_ids, kv_cache, rope_offset=current_offset)
+                current_offset += self.think_tokens
+
+            # --- Denoise the content block ---
+            if self.verbose:
+                logger.info("  [content phase: %d tokens, %d steps]", this_block_size, self.steps)
+            block_ids = torch.full(
+                (num_samples, this_block_size), mask_token_id,
+                dtype=torch.long, device=self.device,
+            )
+            block_ids = self._denoise_block(
+                block_ids, kv_cache, rope_offset=current_offset,
+                n_steps=self.steps, gen=gen,
+            )
+
+            # Commit content block to cache
+            self._commit_block(block_ids, kv_cache, rope_offset=current_offset)
+            current_offset += this_block_size
+
+            # Collect results
+            clamped = block_ids[0].clamp(0, vocab_size - 1)
+            block_text = self.tokenizer.decode(clamped.tolist(), skip_special_tokens=True)
+            block_texts.append(block_text)
+            all_generated.extend(block_ids[0].tolist())
+
+            if self.verbose:
+                logger.info("  committed: %s", block_text[:200])
+
+        # Final decode per sample
+        results = []
+        for b in range(num_samples):
+            # Re-decode all generated tokens for this sample
+            final_ids = torch.tensor(all_generated[:gen_length], dtype=torch.long)
+            final_ids = final_ids.clamp(0, vocab_size - 1)
+            text = self.tokenizer.decode(final_ids.tolist(), skip_special_tokens=True)
+            results.append({"text": text, "blocks": block_texts})
 
         return results
 
@@ -501,6 +788,18 @@ def main() -> None:
     parser.add_argument("--think_steps", type=int, default=10, help="Denoising steps for thinking phase")
     parser.add_argument("--answer_steps", type=int, default=20, help="Denoising steps for answer phase")
 
+    # Block diffusion args
+    parser.add_argument(
+        "--block",
+        action="store_true",
+        help="Use block diffusion sampler (semi-AR with quantized KV cache)",
+    )
+    parser.add_argument("--block_size", type=int, default=256, help="Tokens per block in block diffusion")
+    parser.add_argument(
+        "--block_think_tokens", type=int, default=0,
+        help="Per-block thinking tokens in block diffusion (0=disabled, try 32-64)",
+    )
+
     # MoE args
     parser.add_argument("--use_moe", action="store_true", help="Enable MoE FFN layers")
     parser.add_argument("--n_experts", type=int, default=8, help="Number of experts")
@@ -532,7 +831,38 @@ def main() -> None:
 
     logger.info("Model loaded from %s (step %d)", args.checkpoint, ckpt.get("step", 0))
 
-    if args.thinking:
+    if args.block:
+        logger.info(
+            "Block diffusion: %d sample(s), block_size=%d, steps=%d, think_tokens=%d",
+            args.num_samples, args.block_size, args.steps, args.block_think_tokens,
+        )
+        sampler = BlockDiffusionSampler(
+            model=model,
+            tokenizer=tokenizer,
+            block_size=args.block_size,
+            steps=args.steps,
+            think_tokens=args.block_think_tokens,
+            think_steps=args.think_steps,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            verbose=args.verbose,
+            seed=args.seed,
+            device=device,
+        )
+        results = sampler.generate(
+            prompt=args.prompt,
+            gen_length=args.length,
+            num_samples=args.num_samples,
+        )
+
+        print("\n" + "=" * 60)
+        for i, result in enumerate(results):
+            if args.num_samples > 1:
+                print(f"\n--- Sample {i + 1} ---")
+            print(result["text"])
+        print("=" * 60)
+
+    elif args.thinking:
         if model.config.N_think <= 0:
             raise ValueError("This checkpoint was not trained with thinking tokens enabled.")
         logger.info(

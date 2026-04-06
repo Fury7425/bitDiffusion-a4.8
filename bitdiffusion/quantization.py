@@ -354,6 +354,9 @@ class KVCache:
     By default uses 3-bit quantization, with the BOS token (position 0)
     stored at 4-bit precision to preserve outlier features.
 
+    Appended chunks are stored independently (no re-quantization on
+    append) and concatenated only at read time.
+
     **Important:** In the diffusion sampling loop the KV cache must be
     reset between denoising steps, because each step re-processes the
     full sequence with a new mask pattern. Call ``reset()`` at the start
@@ -369,24 +372,81 @@ class KVCache:
         self.n_layers = n_layers
         self.default_bits = default_bits
         self.bos_bits = bos_bits
-        self._k: list[Optional[_CacheEntry]] = [None] * n_layers
-        self._v: list[Optional[_CacheEntry]] = [None] * n_layers
-        # Separate BOS storage
+        # Each layer stores a list of compressed chunks (append-only)
+        self._k_chunks: list[list[_CacheEntry]] = [[] for _ in range(n_layers)]
+        self._v_chunks: list[list[_CacheEntry]] = [[] for _ in range(n_layers)]
+        # Separate BOS storage at higher precision
         self._k_bos: list[Optional[_CacheEntry]] = [None] * n_layers
         self._v_bos: list[Optional[_CacheEntry]] = [None] * n_layers
+        # Ephemeral mode: update() returns committed+new but doesn't store new
+        self._ephemeral = False
+
+    @property
+    def ephemeral(self) -> bool:
+        return self._ephemeral
+
+    @ephemeral.setter
+    def ephemeral(self, val: bool) -> None:
+        self._ephemeral = val
+
+    def has_committed(self) -> bool:
+        """True if any layer has committed K/V stored."""
+        return any(bos is not None for bos in self._k_bos)
+
+    def committed_len(self) -> int:
+        """Number of committed tokens (BOS + chunks) in the first populated layer."""
+        for i in range(self.n_layers):
+            if self._k_bos[i] is None:
+                continue
+            n = 1  # BOS
+            for c in self._k_chunks[i]:
+                n += c.seq_len
+            return n
+        return 0
 
     def reset(self) -> None:
         """Clear all cached entries. Call at the start of each denoising step."""
         for i in range(self.n_layers):
-            self._k[i] = self._v[i] = None
+            self._k_chunks[i].clear()
+            self._v_chunks[i].clear()
             self._k_bos[i] = self._v_bos[i] = None
+
+    def _dequant_chunks(self, chunks: list[_CacheEntry]) -> Optional[torch.Tensor]:
+        """Dequantize and concatenate a list of compressed chunks."""
+        if not chunks:
+            return None
+        parts = [
+            dequantize_kv(c.packed, c.scale, c.bits, c.orig_last_dim)
+            for c in chunks
+        ]
+        return torch.cat(parts, dim=2) if len(parts) > 1 else parts[0]
+
+    def _read_committed(self, layer_idx: int, head_dim: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Read all committed K/V for a layer without modifying cache state."""
+        if self._k_bos[layer_idx] is None:
+            return None, None
+        bos_k = dequantize_kv(
+            self._k_bos[layer_idx].packed, self._k_bos[layer_idx].scale,
+            self.bos_bits, head_dim,
+        )
+        bos_v = dequantize_kv(
+            self._v_bos[layer_idx].packed, self._v_bos[layer_idx].scale,
+            self.bos_bits, head_dim,
+        )
+        rest_k = self._dequant_chunks(self._k_chunks[layer_idx])
+        rest_v = self._dequant_chunks(self._v_chunks[layer_idx])
+        if rest_k is not None:
+            return torch.cat([bos_k, rest_k], dim=2), torch.cat([bos_v, rest_v], dim=2)
+        return bos_k, bos_v
 
     def update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Append new K/V and return the full dequantized sequence.
 
-        The first call for a layer stores the entire sequence. Subsequent
-        calls append new tokens. The BOS token (position 0) is always
-        stored at ``bos_bits`` precision.
+        In normal mode, new K/V are compressed and stored. In ephemeral
+        mode (``self.ephemeral = True``), committed K/V are read and
+        concatenated with the new K/V, but nothing is stored — this is
+        used during block diffusion denoising where the current block's
+        K/V change every step.
 
         Args:
             layer_idx: Transformer layer index.
@@ -399,12 +459,19 @@ class KVCache:
         """
         head_dim = k.shape[-1]
 
-        if self._k[layer_idx] is None:
-            # First call — store BOS separately
+        # Ephemeral mode: read committed context + concat new, don't store
+        if self._ephemeral:
+            committed_k, committed_v = self._read_committed(layer_idx, head_dim)
+            if committed_k is not None:
+                return torch.cat([committed_k, k], dim=2), torch.cat([committed_v, v], dim=2)
+            return k, v
+
+        # Normal mode: compress and store
+        if self._k_bos[layer_idx] is None:
+            # First call — store BOS separately at higher precision
             k_bos, v_bos = k[:, :, :1, :], v[:, :, :1, :]
             k_rest, v_rest = k[:, :, 1:, :], v[:, :, 1:, :]
 
-            # Quantize BOS at higher precision
             pk_bos, sk_bos = quantize_kv(k_bos, self.bos_bits)
             pv_bos, sv_bos = quantize_kv(v_bos, self.bos_bits)
             self._k_bos[layer_idx] = _CacheEntry(pk_bos, sk_bos, self.bos_bits, head_dim, 1)
@@ -413,52 +480,18 @@ class KVCache:
             if k_rest.shape[2] > 0:
                 pk, sk = quantize_kv(k_rest, self.default_bits)
                 pv, sv = quantize_kv(v_rest, self.default_bits)
-                self._k[layer_idx] = _CacheEntry(pk, sk, self.default_bits, head_dim, k_rest.shape[2])
-                self._v[layer_idx] = _CacheEntry(pv, sv, self.default_bits, head_dim, v_rest.shape[2])
+                self._k_chunks[layer_idx].append(_CacheEntry(pk, sk, self.default_bits, head_dim, k_rest.shape[2]))
+                self._v_chunks[layer_idx].append(_CacheEntry(pv, sv, self.default_bits, head_dim, v_rest.shape[2]))
         else:
-            # Append new tokens at default bits
-            pk_new, sk_new = quantize_kv(k, self.default_bits)
-            pv_new, sv_new = quantize_kv(v, self.default_bits)
+            # Append new tokens as an independent chunk — no re-quantization
+            pk, sk = quantize_kv(k, self.default_bits)
+            pv, sv = quantize_kv(v, self.default_bits)
+            self._k_chunks[layer_idx].append(_CacheEntry(pk, sk, self.default_bits, head_dim, k.shape[2]))
+            self._v_chunks[layer_idx].append(_CacheEntry(pv, sv, self.default_bits, head_dim, v.shape[2]))
 
-            existing_k = self._k[layer_idx]
-            existing_v = self._v[layer_idx]
-
-            # For simplicity, re-quantize the concatenated result
-            k_old = dequantize_kv(existing_k.packed, existing_k.scale, existing_k.bits, existing_k.orig_last_dim)
-            v_old = dequantize_kv(existing_v.packed, existing_v.scale, existing_v.bits, existing_v.orig_last_dim)
-            k_new_deq = dequantize_kv(pk_new, sk_new, self.default_bits, head_dim)
-            v_new_deq = dequantize_kv(pv_new, sv_new, self.default_bits, head_dim)
-
-            k_cat = torch.cat([k_old, k_new_deq], dim=2)
-            v_cat = torch.cat([v_old, v_new_deq], dim=2)
-
-            pk, sk = quantize_kv(k_cat, self.default_bits)
-            pv, sv = quantize_kv(v_cat, self.default_bits)
-            self._k[layer_idx] = _CacheEntry(pk, sk, self.default_bits, head_dim, k_cat.shape[2])
-            self._v[layer_idx] = _CacheEntry(pv, sv, self.default_bits, head_dim, v_cat.shape[2])
-
-        # Dequantize and concatenate BOS + rest
-        bos_k = dequantize_kv(
-            self._k_bos[layer_idx].packed, self._k_bos[layer_idx].scale,
-            self.bos_bits, head_dim
-        )
-        bos_v = dequantize_kv(
-            self._v_bos[layer_idx].packed, self._v_bos[layer_idx].scale,
-            self.bos_bits, head_dim
-        )
-
-        if self._k[layer_idx] is not None:
-            rest_k = dequantize_kv(
-                self._k[layer_idx].packed, self._k[layer_idx].scale,
-                self.default_bits, head_dim
-            )
-            rest_v = dequantize_kv(
-                self._v[layer_idx].packed, self._v[layer_idx].scale,
-                self.default_bits, head_dim
-            )
-            return torch.cat([bos_k, rest_k], dim=2), torch.cat([bos_v, rest_v], dim=2)
-        else:
-            return bos_k, bos_v
+        # Return all committed K/V
+        committed_k, committed_v = self._read_committed(layer_idx, head_dim)
+        return committed_k, committed_v
 
 
 class HybridKVCache:

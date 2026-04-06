@@ -73,19 +73,19 @@ class TrainConfig:
     train_data: str = "data/train/*.jsonl"
     val_data: str = "data/val/*.jsonl"
     output_dir: str = "checkpoints"
-    max_steps: int = 100000
-    batch_size: int = 8
-    max_seq_len: int = 512
-    lr: float = 1e-3
+    max_steps: int = 115000
+    batch_size: int = 16
+    max_seq_len: int = 2048
+    lr: float = 1.5e-4
     weight_decay: float = 0.01
-    warmup_steps: int = 1000
-    grad_accum_steps: int = 1
+    warmup_steps: int = 2000
+    grad_accum_steps: int = 8
     grad_clip_norm: float = 1.0
     a4_warmup_fraction: float = 0.10
     save_every: int = 5000
     val_every: int = 1000
     bitstats_every: int = 500
-    num_workers: int = 2
+    num_workers: int = 4
     seed: int = 42
     resume_from: str = ""
     wandb_project: str = "bitdiffusion-a48"
@@ -93,11 +93,12 @@ class TrainConfig:
     device: str = "cuda"
 
     # Model config fields (forwarded to ModelConfig)
+    # Defaults match the 1B recommended config (~30B tokens)
     vocab_size: int = 0  # 0 = auto from tokenizer
-    hidden_dim: int = 768
-    n_layers: int = 12
-    n_heads: int = 12
-    ffn_dim: int = 0
+    hidden_dim: int = 2048
+    n_layers: int = 16
+    n_heads: int = 16
+    ffn_dim: int = 8192
     topk_ratio: float = 0.55
     dropout: float = 0.0
     t_embed_dim: int = 256
@@ -106,7 +107,7 @@ class TrainConfig:
 
     # Thinking tokens
     N_think: int = 64       # 0 = disabled
-    think_prob: float = 0.5 # probability of prepending think tokens during training
+    think_prob: float = 1.0 # always prepend think tokens during training
 
     # Mixture of Experts
     use_moe: bool = False
@@ -115,6 +116,9 @@ class TrainConfig:
     moe_layers: str = "alternate"
     aux_loss_weight: float = 0.01
     expert_capacity_factor: float = 1.25
+
+    # Training efficiency
+    gradient_checkpointing: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +347,7 @@ def train(cfg: TrainConfig) -> None:
         moe_layers=cfg.moe_layers,
         aux_loss_weight=cfg.aux_loss_weight,
         expert_capacity_factor=cfg.expert_capacity_factor,
+        gradient_checkpointing=cfg.gradient_checkpointing,
     )
 
     # Model
@@ -429,11 +434,13 @@ def train(cfg: TrainConfig) -> None:
 
     # Set initial activation mode
     model.set_activation_mode(current_mode)
+    if cfg.gradient_checkpointing:
+        logger.info("Gradient checkpointing enabled — trading compute for memory")
     model.train()
 
     # --- Training loop ---
     logger.info("Starting training for %d steps", cfg.max_steps)
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     running_loss = 0.0
     step_in_accum = 0
     epoch = 0
@@ -488,7 +495,7 @@ def train(cfg: TrainConfig) -> None:
             scaler.step(optimizer)
             scaler.update()
             lr_scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
             step_in_accum = 0

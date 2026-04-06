@@ -1,126 +1,176 @@
+"""
+BitDiffusion a4.8 — English-only data preparation (~40B tokens)
+
+OUTPUT FORMAT  (matches StreamingJsonlDataset in data.py — do NOT change)
+  Each line: {"text": "..."}
+
+RECOMMENDED TRAINING CONFIGS
+──────────────────────────────────────────────────────────────────
+1B MODEL  (~30B tokens — 30 tokens/param, uses full data mix)
+  hidden_dim=2048  n_layers=16  n_heads=16  head_dim=128
+  ffn_dim=8192     seq_len=2048  batch_size=16  grad_accum=8
+  peak_lr=1.5e-4   warmup_steps=2000  max_steps=115_000
+  a4_warmup_fraction=0.10  gradient_checkpointing=True
+  → 115K × (16 × 2048 × 8) = ~30.1B tokens
+
+  Budget variant (~13B tokens / $200 / 7 days A100 40GB spot):
+    max_steps=50_000 → ~13.1B tokens (undertrained but functional)
+
+2B MODEL  (~43B tokens — 21 tokens/param, full data mix)
+  hidden_dim=2048  n_layers=32  n_heads=16  head_dim=128
+  ffn_dim=8192     seq_len=2048  batch_size=8   grad_accum=16
+  peak_lr=1e-4     warmup_steps=2000  max_steps=165_000
+  a4_warmup_fraction=0.10  gradient_checkpointing=True
+  → 165K × (8 × 2048 × 16) = ~43.3B tokens
+
+  Budget variant (~20B tokens / $450):
+    max_steps=76_000 → ~19.9B tokens
+──────────────────────────────────────────────────────────────────
+
+DATASET MIX  (~40B tokens, English only)
+┌─────────────────┬──────────────────────────────────────────────────────┬───────┐
+│ Slug            │ Source                                               │Tokens │
+├─────────────────┼──────────────────────────────────────────────────────┼───────┤
+│ fineweb_edu     │ HuggingFaceFW/fineweb-edu (sample-100BT)             │  15B  │
+│                 │ Llama-3-70B scored educational web — gold standard   │       │
+├─────────────────┼──────────────────────────────────────────────────────┼───────┤
+│ dclm            │ HuggingFaceFW/dclm_100BT                             │   8B  │
+│                 │ Model-filtered CC; beats SlimPajama/RefinedWeb/Dolma │       │
+├─────────────────┼──────────────────────────────────────────────────────┼───────┤
+│ open_web_math   │ open-web-math/open-web-math (14.7B total)            │   7B  │
+│                 │ Best-in-class math/STEM web corpus                   │       │
+├─────────────────┼──────────────────────────────────────────────────────┼───────┤
+│ cosmopedia      │ HuggingFaceTB/cosmopedia (~30B total)                │   4B  │
+│                 │ Synthetic textbook/story — strong reasoning signal   │       │
+├─────────────────┼──────────────────────────────────────────────────────┼───────┤
+│ wikipedia_en    │ wikimedia/wikipedia 20231101.en (~4.4B total)        │   2B  │
+│                 │ Encyclopedic ground-truth factual knowledge          │       │
+├─────────────────┼──────────────────────────────────────────────────────┼───────┤
+│ finepdfs        │ HuggingFaceFW/finepdfs_100BT                        │   2B  │
+│                 │ PDF-extracted academic papers, books, tech docs      │       │
+├─────────────────┼──────────────────────────────────────────────────────┼───────┤
+│ mathcode_pile   │ MathGenie/MathCode-Pile (19.2B total)               │   2B  │
+│                 │ Math web + textbooks + model-synth + math code       │       │
+└─────────────────┴──────────────────────────────────────────────────────┴───────┘
+                                                               TOTAL:    40B
+"""
+
 import json
+import os
 import random
+import tempfile
 from pathlib import Path
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
 TOKENIZER_NAME = "Qwen/Qwen-tokenizer"
-VAL_RATIO = 0.01
-SEED = 42
-MIN_TOKENS = 32
-MAX_TOKENS = 32768
+VAL_RATIO      = 0.005   # 0.5% val — plenty of data, keep val small
+SEED           = 42
+MIN_TOKENS     = 64
+MAX_TOKENS     = 8192
+CHUNK_OVERLAP  = 128     # overlap between chunks when splitting long docs
+BATCH_SIZE     = 128     # batch tokenisation — much faster than one-at-a-time
+SHUFFLE_BUCKET = 500_000 # lines held in memory during streaming shuffle
 
-TRAIN_DIR = Path("data/train")
-VAL_DIR = Path("data/val")
-SHARD_DIR = Path("data/hf_shards")
-STATE_PATH = SHARD_DIR / "progress.json"
+TRAIN_DIR   = Path("data/train")
+VAL_DIR     = Path("data/val")
+SHARD_DIR   = Path("data/hf_shards")
+STATE_PATH  = SHARD_DIR / "progress.json"
 FINAL_TRAIN = TRAIN_DIR / "hf_mix_train.jsonl"
-FINAL_VAL = VAL_DIR / "hf_mix_val.jsonl"
+FINAL_VAL   = VAL_DIR   / "hf_mix_val.jsonl"
 
-# =========================================================
-# UPDATED DATASET MIX (wiki + math boosted, balanced EN/KO)
-# =========================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# DATASETS
+# All use text_field="text" (confirmed for fineweb_edu, dclm, open_web_math,
+# cosmopedia, wikipedia_en, finepdfs).
+# mathcode_pile field assumed "text" — if it produces 0 docs, change to "content"
+# ──────────────────────────────────────────────────────────────────────────────
 DATASETS = [
-    # =========================
-    # ENGLISH (~55%)
-    # =========================
     {
-        "slug": "fineweb_edu_en",
-        "path": "HuggingFaceFW/fineweb_edu_100BT",
-        "split": "train",
-        "target_tokens": 100_000_000,
-        "text_field": "text",
+        "slug":          "fineweb_edu",
+        "path":          "HuggingFaceFW/fineweb-edu",
+        "name":          "sample-100BT",
+        "split":         "train",
+        "target_tokens": 15_000_000_000,
+        "text_field":    "text",
     },
     {
-        "slug": "structured_wiki_en",
-        "path": "wikimedia/structured-wikipedia",
-        "split": "train",
-        "target_tokens": 80_000_000,
-        "text_field": "text",
+        "slug":          "dclm",
+        "path":          "HuggingFaceFW/dclm_100BT",
+        "split":         "train",
+        "target_tokens": 8_000_000_000,
+        "text_field":    "text",
     },
     {
-        "slug": "open_web_math_en",
-        "path": "open-web-math/open-web-math",
-        "split": "train",
-        "target_tokens": 70_000_000,
-        "text_field": "text",
+        "slug":          "open_web_math",
+        "path":          "open-web-math/open-web-math",
+        "split":         "train",
+        "target_tokens": 7_000_000_000,
+        "text_field":    "text",
     },
     {
-        "slug": "gsm8k_reasoning_en",
-        "path": "notefill/gsm8k-instruction",
-        "split": "train",
-        "target_tokens": 40_000_000,
-        "text_field": "question",  # merged below
+        "slug":          "cosmopedia",
+        "path":          "HuggingFaceTB/cosmopedia",
+        "split":         "train",
+        "target_tokens": 4_000_000_000,
+        "text_field":    "text",
     },
     {
-        "slug": "wikipedia_en",
-        "path": "wikimedia/wikipedia",
-        "name": "20231101.en",
-        "split": "train",
-        "target_tokens": 40_000_000,
-        "text_field": "text",
+        "slug":          "wikipedia_en",
+        "path":          "wikimedia/wikipedia",
+        "name":          "20231101.en",
+        "split":         "train",
+        "target_tokens": 2_000_000_000,
+        "text_field":    "text",
     },
     {
-        "slug": "cosmopedia_en",
-        "path": "HuggingFaceTB/cosmopedia",
-        "split": "train",
-        "target_tokens": 30_000_000,
-        "text_field": "text",
+        "slug":          "finepdfs",
+        "path":          "HuggingFaceFW/finepdfs_100BT",
+        "split":         "train",
+        "target_tokens": 2_000_000_000,
+        "text_field":    "text",
+    },
+    {
+        # 19.2B tokens: math web pages + textbooks + model-synthesised + math code
+        # text_field assumed "text" — if docs=0 after start, change to "content"
+        "slug":          "mathcode_pile",
+        "path":          "MathGenie/MathCode-Pile",
+        "split":         "train",
+        "target_tokens": 2_000_000_000,
+        "text_field":    "text",
     },
 
-    # =========================
-    # KOREAN (~45%)
-    # =========================
+    # ── CODE ──────────────────────────────────────────────────────────────────
+    # StarCoderData uses "content" field (not "text") and data_dir for language.
+    # Python: ~35B tokens available.  JS/TS: ~24B tokens available.
+    # Code improves reasoning, instruction-following, and structured generation.
     {
-        "slug": "korean_webtext_edu",
-        "path": "eliceai/korean-webtext-edu",
-        "split": "train",
-        "target_tokens": 80_000_000,
-        "text_field": "text",
+        "slug":          "starcoder_python",
+        "path":          "bigcode/starcoderdata",
+        "data_dir":      "python",
+        "split":         "train",
+        "target_tokens": 2_000_000_000,
+        "text_field":    "content",
     },
     {
-        "slug": "fineweb2_edu_ko",
-        "path": "minpeter/fineweb-2-edu-korean",
-        "split": "train",
-        "target_tokens": 80_000_000,
-        "text_field": "text",
-    },
-    {
-        "slug": "wiki_ko_clean",
-        "path": "lcw99/wikipedia-korean-20221001",
-        "split": "train",
-        "target_tokens": 40_000_000,
-        "text_field": "text",
-    },
-    {
-        "slug": "wiki_qa_ko",
-        "path": "lcw99/wikipedia-korean-20240501-1million-qna",
-        "split": "train",
-        "target_tokens": 30_000_000,
-        "text_field": "context",
-    },
-    {
-        "slug": "math_reasoning_ko",
-        "path": "Mobiusi/math_ko_reasoning_10K",
-        "split": "train",
-        "target_tokens": 20_000_000,
-        "text_field": "question",  # merged below
-    },
-    {
-        "slug": "korean_webtext",
-        "path": "HAERAE-HUB/KOREAN-WEBTEXT",
-        "split": "train",
-        "target_tokens": 30_000_000,
-        "text_field": "text",
+        "slug":          "starcoder_js",
+        "path":          "bigcode/starcoderdata",
+        "data_dir":      "javascript",
+        "split":         "train",
+        "target_tokens": 1_000_000_000,
+        "text_field":    "content",
     },
 ]
+# Total target: 15B + 8B + 7B + 4B + 2B + 2B + 2B + 2B + 1B = 43B tokens
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
 def ensure_dirs():
-    TRAIN_DIR.mkdir(parents=True, exist_ok=True)
-    VAL_DIR.mkdir(parents=True, exist_ok=True)
-    SHARD_DIR.mkdir(parents=True, exist_ok=True)
+    for d in (TRAIN_DIR, VAL_DIR, SHARD_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
 
 def shard_paths(spec):
@@ -137,180 +187,230 @@ def load_state():
 
 
 def save_state(state):
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def load_stream(spec):
-    kwargs = {
-        "path": spec["path"],
-        "split": spec["split"],
-        "streaming": True,
-    }
-    if spec.get("name"):
-        kwargs["name"] = spec["name"]
+    kwargs = {"path": spec["path"], "split": spec["split"], "streaming": True}
+    if spec.get("name"):     kwargs["name"]     = spec["name"]
+    if spec.get("data_dir"): kwargs["data_dir"] = spec["data_dir"]
     return load_dataset(**kwargs)
 
 
-# =========================================================
-# 🔥 IMPROVED TEXT EXTRACTION (reasoning-aware)
-# =========================================================
 def iter_texts(spec):
-    text_field = spec.get("text_field", "text")
-
+    field = spec.get("text_field", "text")
+    fallback = "content" if field == "text" else "text"
+    detected = False
     for row in load_stream(spec):
-        text = None
-
-        # ---- Custom handling for reasoning datasets ----
-        if spec["slug"] == "math_reasoning_ko":
-            q = row.get("question", "")
-            a = row.get("answer", "")
-            e = row.get("explanation", "")
-            text = f"문제: {q}\n정답: {a}\n풀이: {e}"
-
-        elif spec["slug"] == "gsm8k_reasoning_en":
-            q = row.get("question", "")
-            a = row.get("answer", "")
-            text = f"Question: {q}\nAnswer: {a}"
-
-        else:
-            text = row.get(text_field)
-
+        text = row.get(field)
+        if not detected and text is None:
+            text = row.get(fallback)
+            if text is not None:
+                print(f"  auto-detected text_field='{fallback}' for {spec['slug']}")
+                field = fallback
+        detected = True
         if isinstance(text, str):
             text = text.strip()
-
         if text:
             yield text
 
 
-def count_tokens(tokenizer, text):
-    encoded = tokenizer(
-        text,
-        add_special_tokens=False,
-        return_attention_mask=False,
-        return_token_type_ids=False,
-        verbose=False,
-    )
-    return len(encoded["input_ids"])
-
-
 def needs_rebuild(spec, state):
     slug = spec["slug"]
-    source_state = state.get(slug, {})
-    train_shard, val_shard = shard_paths(spec)
-
-    if not source_state.get("complete"):
+    src  = state.get(slug, {})
+    t, v = shard_paths(spec)
+    if not src.get("complete"):           return True
+    if not t.exists() or not v.exists(): return True
+    if src.get("target_tokens", 0) != spec["target_tokens"]:
+        print(f"  {slug}: target changed → rebuilding")
         return True
-    if not train_shard.exists() or not val_shard.exists():
-        return True
-
-    if source_state.get("target_tokens", 0) != spec["target_tokens"]:
-        print(f"{slug}: target changed → rebuilding")
-        return True
-
     return False
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# BUILD ONE SOURCE SHARD
+# Uses batched tokenisation (BATCH_SIZE docs at a time) for speed.
+# ──────────────────────────────────────────────────────────────────────────────
 def build_source(tokenizer, spec, state):
     slug = spec["slug"]
     train_shard, val_shard = shard_paths(spec)
 
     if not needs_rebuild(spec, state):
-        print(f"Skipping {slug}")
-        return state.get(slug, {})
+        s = state[slug]
+        print(f"  skip {slug:<20} {s['tokens']/1e9:.2f}B tokens already collected")
+        return s
 
-    rng = random.Random(f"{SEED}:{slug}")
+    rng    = random.Random(f"{SEED}:{slug}")
     target = spec["target_tokens"]
+    docs = written = train_tokens = val_tokens = 0
 
-    docs = 0
-    written = 0
-    train_tokens = 0
-    val_tokens = 0
+    print(f"\n  building {slug}  (target {target/1e9:.0f}B tokens)")
 
-    print(f"Starting {slug} ({target:,} tokens)")
+    buf = []
 
-    with train_shard.open("w", encoding="utf-8") as train_f, val_shard.open("w", encoding="utf-8") as val_f:
+    with train_shard.open("w", encoding="utf-8") as tf, \
+         val_shard.open("w",   encoding="utf-8") as vf:
+
+        def flush(buf):
+            nonlocal docs, written, train_tokens, val_tokens
+            if not buf:
+                return
+            enc = tokenizer(
+                buf,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+                truncation=False,
+                verbose=False,
+            )
+            for text, ids in zip(buf, enc["input_ids"]):
+                tc = len(ids)
+                if tc < MIN_TOKENS:
+                    continue
+                # chunk long docs with overlap instead of dropping them
+                if tc > MAX_TOKENS:
+                    step = MAX_TOKENS - CHUNK_OVERLAP
+                    for start in range(0, tc, step):
+                        chunk_ids = ids[start : start + MAX_TOKENS]
+                        if len(chunk_ids) < MIN_TOKENS:
+                            break
+                        chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True)
+                        ctc = len(chunk_ids)
+                        line = json.dumps({"text": chunk_text}, ensure_ascii=False) + "\n"
+                        if rng.random() < VAL_RATIO:
+                            vf.write(line);  val_tokens   += ctc
+                        else:
+                            tf.write(line);  train_tokens += ctc
+                        written += ctc
+                        docs    += 1
+                else:
+                    line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
+                    if rng.random() < VAL_RATIO:
+                        vf.write(line);  val_tokens   += tc
+                    else:
+                        tf.write(line);  train_tokens += tc
+                    written += tc
+                    docs    += 1
+
         for text in iter_texts(spec):
-            token_count = count_tokens(tokenizer, text)
+            buf.append(text)
+            if len(buf) >= BATCH_SIZE:
+                flush(buf); buf = []
+                if docs % 10_000 == 0 and docs > 0:
+                    print(f"    {slug}: {docs:>8,} docs  {written/1e9:.3f}B / {target/1e9:.0f}B tokens")
+                if written >= target:
+                    break
+        flush(buf)
 
-            if token_count < MIN_TOKENS or token_count > MAX_TOKENS:
-                continue
-
-            line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
-
-            if rng.random() < VAL_RATIO:
-                val_f.write(line)
-                val_tokens += token_count
-            else:
-                train_f.write(line)
-                train_tokens += token_count
-
-            written += token_count
-            docs += 1
-
-            if docs % 1000 == 0:
-                print(f"{slug}: docs={docs:,}, tokens={written:,}")
-
-            if written >= target:
-                break
+    # warn if almost nothing came through (wrong field name)
+    if docs < 100:
+        print(f"  WARNING: {slug} produced only {docs} docs — check text_field value")
 
     result = {
-        "complete": True,
+        "complete":      True,
         "target_tokens": target,
-        "docs": docs,
-        "tokens": written,
-        "train_tokens": train_tokens,
-        "val_tokens": val_tokens,
+        "docs":          docs,
+        "tokens":        written,
+        "train_tokens":  train_tokens,
+        "val_tokens":    val_tokens,
     }
-
     state[slug] = result
     save_state(state)
-
-    print(f"Finished {slug}: {written:,} tokens")
+    print(f"  done {slug:<20} {written/1e9:.3f}B tokens  {docs:,} docs")
     return result
 
 
-# =========================================================
-# 🔥 GLOBAL SHUFFLE (CRITICAL FOR MULTITASK RETENTION)
-# =========================================================
-def assemble_final_files_shuffled(state):
+# ──────────────────────────────────────────────────────────────────────────────
+# GLOBAL SHUFFLE  (prevents any domain clustering in training)
+# ──────────────────────────────────────────────────────────────────────────────
+def assemble_shuffled(state):
+    """Streaming bucket-shuffle: never holds more than SHUFFLE_BUCKET lines in RAM."""
     rng = random.Random(SEED)
 
-    for split_name, final_path in [("train", FINAL_TRAIN), ("val", FINAL_VAL)]:
-        print(f"\nAssembling {split_name}...")
+    for split, final in [("train", FINAL_TRAIN), ("val", FINAL_VAL)]:
+        print(f"\nassembling {split}...")
 
-        lines = []
-
+        # count lines and collect shard paths
+        shards = []
+        total_lines = 0
         for spec in DATASETS:
-            shard = shard_paths(spec)[0 if split_name == "train" else 1]
-
+            shard = shard_paths(spec)[0 if split == "train" else 1]
             if not shard.exists():
+                print(f"  WARNING: missing shard {shard.name} — skipping")
                 continue
+            n = sum(1 for line in shard.open(encoding="utf-8") if line.strip())
+            print(f"  {spec['slug']:<20} {n:>8,} docs")
+            shards.append(shard)
+            total_lines += n
 
-            with shard.open("r", encoding="utf-8") as f:
+        if total_lines == 0:
+            print(f"  WARNING: no data for {split}")
+            continue
+
+        # assign each line to a random bucket (temp file)
+        n_buckets = max(1, total_lines // SHUFFLE_BUCKET)
+        tmp_dir = tempfile.mkdtemp(prefix="hf_shuffle_")
+        bucket_files = [
+            open(os.path.join(tmp_dir, f"bucket_{i}.jsonl"), "w", encoding="utf-8")
+            for i in range(n_buckets)
+        ]
+
+        print(f"  distributing {total_lines:,} docs into {n_buckets} buckets...")
+        for shard in shards:
+            with shard.open(encoding="utf-8") as f:
                 for line in f:
-                    if line.strip():
-                        lines.append(line)
+                    if not line.strip():
+                        continue
+                    bucket_files[rng.randrange(n_buckets)].write(line)
 
-        print(f"Loaded {len(lines):,} docs → shuffling...")
-        rng.shuffle(lines)
+        for bf in bucket_files:
+            bf.close()
 
-        with final_path.open("w", encoding="utf-8") as out:
-            for line in lines:
-                out.write(line)
+        # shuffle each bucket in memory and write to final output
+        print(f"  writing {final}...")
+        written = 0
+        with final.open("w", encoding="utf-8") as out:
+            for i in range(n_buckets):
+                bp = os.path.join(tmp_dir, f"bucket_{i}.jsonl")
+                with open(bp, encoding="utf-8") as bf:
+                    bucket = bf.readlines()
+                rng.shuffle(bucket)
+                out.writelines(bucket)
+                written += len(bucket)
+                os.remove(bp)
 
-        print(f"Wrote {len(lines):,} docs → {final_path}")
+        os.rmdir(tmp_dir)
+        gb = final.stat().st_size / 1e9
+        print(f"  wrote {final}  ({gb:.1f} GB, {written:,} docs)")
 
 
+def print_summary(state):
+    total = sum(v.get("tokens", 0) for v in state.values())
+    print(f"\n{'─'*58}")
+    print(f"  {'Dataset':<20} {'Tokens':>10}  {'Docs':>10}  St")
+    print(f"{'─'*58}")
+    for spec in DATASETS:
+        s    = state.get(spec["slug"], {})
+        flag = "✓" if s.get("complete") else "·"
+        print(f"  {flag} {spec['slug']:<19} {s.get('tokens',0)/1e9:>8.2f}B  {s.get('docs',0):>10,}")
+    print(f"{'─'*58}")
+    print(f"  {'TOTAL':<20} {total/1e9:>8.2f}B")
+    print(f"{'─'*58}\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
     ensure_dirs()
-
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    state = load_state()
+    state     = load_state()
 
     for spec in DATASETS:
         build_source(tokenizer, spec, state)
 
-    assemble_final_files_shuffled(state)
+    print_summary(state)
+    assemble_shuffled(state)
 
 
 if __name__ == "__main__":

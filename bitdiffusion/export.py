@@ -177,7 +177,7 @@ def main() -> None:
         help="Enable thinking token layout for legacy checkpoints without embedded model_config",
     )
     parser.add_argument("--n_think", type=int, default=64)
-    parser.add_argument("--think_prob", type=float, default=0.5)
+    parser.add_argument("--think_prob", type=float, default=1.0)
     parser.add_argument("--use_moe", action="store_true", help="Enable MoE FFN layers")
     parser.add_argument("--n_experts", type=int, default=8)
     parser.add_argument("--top_k_experts", type=int, default=2)

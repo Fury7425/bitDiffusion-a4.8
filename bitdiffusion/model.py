@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
+
 from .quantization import HybridQuantizer, KVCache, absmax_quantize_int8, ste_ternary
 
 
@@ -69,7 +71,7 @@ class ModelConfig:
     # --- Thinking tokens ---
     think_token_id: int = 0   # set automatically in __post_init__ if 0
     N_think: int = 64         # number of thinking token positions (0 = disabled)
-    think_prob: float = 0.5   # probability of including thinking prefix during training
+    think_prob: float = 1.0   # probability of including thinking prefix during training
 
     # --- Mixture of Experts ---
     use_moe: bool = False
@@ -79,11 +81,18 @@ class ModelConfig:
     aux_loss_weight: float = 0.01
     expert_capacity_factor: float = 1.25
 
+    # Training efficiency
+    gradient_checkpointing: bool = False
+
     def __post_init__(self):
         if self.head_dim == 0:
             self.head_dim = self.hidden_dim // self.n_heads
         if self.ffn_dim == 0:
             self.ffn_dim = self.hidden_dim * 4
+        if self.hidden_dim % self.n_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({self.hidden_dim}) must be divisible by n_heads ({self.n_heads})"
+            )
         # think_token_id defaults to vocab_size + 1 (mask is vocab_size)
         if self.think_token_id == 0 and self.N_think > 0:
             self.think_token_id = self.vocab_size + 1
@@ -345,13 +354,13 @@ class BitAttention(nn.Module):
                                 act_mode="topk_int8", topk_ratio=config.topk_ratio)
 
         self.rope = RotaryEmbedding(config.head_dim, config.max_seq_len, config.rope_theta)
-        self.attn_dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
     def forward(
         self,
         x: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
         layer_idx: int = 0,
+        rope_offset: int = 0,
     ) -> torch.Tensor:
         """Compute bidirectional self-attention.
 
@@ -359,6 +368,7 @@ class BitAttention(nn.Module):
             x: (B, T, hidden_dim) input tensor.
             kv_cache: Optional KVCache for inference.
             layer_idx: Layer index (for KV cache addressing).
+            rope_offset: Position offset for RoPE (used in block diffusion).
 
         Returns:
             (B, T, hidden_dim) output tensor.
@@ -369,21 +379,20 @@ class BitAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE
-        q = self.rope(q)
-        k = self.rope(k)
+        # Apply RoPE with position offset for block diffusion
+        q = self.rope(q, offset=rope_offset)
+        k = self.rope(k, offset=rope_offset)
 
         # KV cache (inference only)
         if kv_cache is not None:
             k, v = kv_cache.update(layer_idx, k, v)
 
         # Scaled dot-product attention (no causal mask)
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        out = torch.matmul(attn, v)  # (B, n_heads, T, head_dim)
+        # Uses FlashAttention / memory-efficient backend when available
+        dropout_p = self.config.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False,
+        )  # (B, n_heads, T, head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, hidden_dim)
 
         return self.o_proj(out)
@@ -639,6 +648,7 @@ class BitBlock(nn.Module):
         x: torch.Tensor,
         t_emb: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
+        rope_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through one transformer block.
 
@@ -646,6 +656,7 @@ class BitBlock(nn.Module):
             x: (B, T, hidden_dim) input.
             t_emb: (B, t_embed_dim) noise level embedding.
             kv_cache: Optional KVCache for inference.
+            rope_offset: Position offset for RoPE (used in block diffusion).
 
         Returns:
             Tuple of (output, aux_loss) where output is (B, T, hidden_dim)
@@ -654,7 +665,7 @@ class BitBlock(nn.Module):
         # Pre-norm + noise injection
         h = self.attn_norm(x)
         h = h + self.t_proj(t_emb).unsqueeze(1)  # additive bias from t
-        h = self.drop(self.attn(h, kv_cache=kv_cache, layer_idx=self.layer_idx))
+        h = self.drop(self.attn(h, kv_cache=kv_cache, layer_idx=self.layer_idx, rope_offset=rope_offset))
         x = x + h
 
         h = self.ffn_norm(x)
@@ -755,6 +766,7 @@ class BitDiffusionTransformer(nn.Module):
         input_ids: torch.Tensor,
         t: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
+        rope_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -762,6 +774,9 @@ class BitDiffusionTransformer(nn.Module):
             input_ids: (B, T) token IDs (may contain mask tokens).
             t: (B,) noise levels per sample.
             kv_cache: Optional KVCache for inference.
+            rope_offset: Position offset for RoPE (used in block diffusion
+                         to give correct absolute positions when forwarding
+                         only a subsequence).
 
         Returns:
             Tuple of (logits, aux_loss) where logits is (B, T, V) and
@@ -774,8 +789,14 @@ class BitDiffusionTransformer(nn.Module):
         t_emb = self.noise_embed(t)  # (B, t_embed_dim)
 
         total_aux_loss = torch.tensor(0.0, device=x.device)
+        use_ckpt = self.config.gradient_checkpointing and self.training
         for block in self.blocks:
-            x, aux_loss = block(x, t_emb, kv_cache=kv_cache)
+            if use_ckpt:
+                x, aux_loss = grad_checkpoint(
+                    block, x, t_emb, kv_cache, rope_offset, use_reentrant=False,
+                )
+            else:
+                x, aux_loss = block(x, t_emb, kv_cache=kv_cache, rope_offset=rope_offset)
             total_aux_loss = total_aux_loss + aux_loss
 
         x = self.final_norm(x)
