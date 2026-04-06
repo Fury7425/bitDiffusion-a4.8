@@ -14,6 +14,7 @@ import glob
 import logging
 import math
 import os
+import signal
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -73,18 +74,22 @@ class TrainConfig:
     train_data: str = "data/train/*.jsonl"
     val_data: str = "data/val/*.jsonl"
     output_dir: str = "checkpoints"
-    max_steps: int = 115000
+    # 57 500 steps × (16 batch × 16 accum × 2048 seq) = 30.1B tokens
+    # Same token budget as before but 2× larger effective batch (524K tok/step)
+    # for stabler diffusion-loss gradients.
+    max_steps: int = 57500
     batch_size: int = 16
     max_seq_len: int = 2048
-    lr: float = 1.5e-4
-    weight_decay: float = 0.01
-    warmup_steps: int = 2000
-    grad_accum_steps: int = 8
+    lr: float = 2e-4
+    weight_decay: float = 0.05
+    warmup_steps: int = 4000
+    grad_accum_steps: int = 16
     grad_clip_norm: float = 1.0
+    min_lr_ratio: float = 0.1       # cosine floor: decays to 10% of peak LR, not 0
     a4_warmup_fraction: float = 0.10
-    save_every: int = 5000
-    val_every: int = 1000
-    bitstats_every: int = 500
+    save_every: int = 2500
+    val_every: int = 500
+    bitstats_every: int = 250
     num_workers: int = 4
     seed: int = 42
     resume_from: str = ""
@@ -163,12 +168,19 @@ class ActivationSchedule:
 # LR scheduler helpers
 # ---------------------------------------------------------------------------
 
-def _cosine_with_warmup(step: int, warmup_steps: int, max_steps: int) -> float:
-    """Compute LR multiplier for cosine schedule with linear warmup."""
+def _cosine_with_warmup(
+    step: int, warmup_steps: int, max_steps: int, min_lr_ratio: float = 0.1
+) -> float:
+    """Compute LR multiplier for cosine schedule with linear warmup.
+
+    Decays to ``min_lr_ratio`` of peak LR rather than 0, preventing
+    destabilisation in the final training steps.
+    """
     if step < warmup_steps:
         return step / max(warmup_steps, 1)
     progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +395,10 @@ def train(cfg: TrainConfig) -> None:
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: _cosine_with_warmup(step, cfg.warmup_steps, cfg.max_steps)
+        optimizer,
+        lambda step: _cosine_with_warmup(
+            step, cfg.warmup_steps, cfg.max_steps, cfg.min_lr_ratio
+        ),
     )
 
     # Mixed precision
@@ -437,6 +452,16 @@ def train(cfg: TrainConfig) -> None:
     if cfg.gradient_checkpointing:
         logger.info("Gradient checkpointing enabled — trading compute for memory")
     model.train()
+
+    # --- SIGTERM handler (GCP preemptible VMs send SIGTERM 30s before kill) ---
+    _stop_requested = False
+
+    def _handle_sigterm(signum, frame):  # noqa: ANN001
+        nonlocal _stop_requested
+        logger.warning("SIGTERM received — saving checkpoint and exiting cleanly.")
+        _stop_requested = True
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     # --- Training loop ---
     logger.info("Starting training for %d steps", cfg.max_steps)
@@ -552,6 +577,15 @@ def train(cfg: TrainConfig) -> None:
                 wandb_logger.log({"val/sample": sample_text}, step=global_step)
 
                 model.train()
+
+            # --- Preemption / SIGTERM ---
+            if _stop_requested:
+                ckpt_path = os.path.join(cfg.output_dir, f"step_{global_step}_preempted.pt")
+                save_checkpoint(ckpt_path, model, optimizer, lr_scheduler,
+                                global_step, current_mode)
+                logger.info("Preemption checkpoint saved to %s — exiting.", ckpt_path)
+                wandb_logger.finish()
+                return
 
             # --- Checkpoint ---
             if global_step % cfg.save_every == 0:
