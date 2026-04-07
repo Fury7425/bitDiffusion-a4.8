@@ -71,10 +71,27 @@ TOKENIZER_NAME = "Qwen/Qwen-tokenizer"
 VAL_RATIO      = 0.005   # 0.5% val — plenty of data, keep val small
 SEED           = 42
 MIN_TOKENS     = 64
-MAX_TOKENS     = 8192
+MAX_TOKENS     = 4096    # hard cap — matches model max_seq_len
 CHUNK_OVERLAP  = 128     # overlap between chunks when splitting long docs
 BATCH_SIZE     = 128     # batch tokenisation — much faster than one-at-a-time
 SHUFFLE_BUCKET = 500_000 # lines held in memory during streaming shuffle
+
+# Variable sequence length distribution.
+# Teaches the model to handle short AND long contexts rather than always
+# seeing full 4096-token sequences. Weighted toward longer sequences so
+# the model gets good long-context training, but sees enough short ones
+# to handle "hi → hi, how are you?" style responses cleanly.
+# Format: (seq_len, relative_weight)
+SEQ_LENGTH_DIST = [
+    (128,  5),
+    (256,  8),
+    (512,  12),
+    (1024, 20),
+    (2048, 25),
+    (4096, 30),
+]
+_SEQ_LENS    = [l for l, _ in SEQ_LENGTH_DIST]
+_SEQ_WEIGHTS = [w for _, w in SEQ_LENGTH_DIST]
 
 TRAIN_DIR   = Path("data/train")
 VAL_DIR     = Path("data/val")
@@ -272,30 +289,27 @@ def build_source(tokenizer, spec, state):
                 tc = len(ids)
                 if tc < MIN_TOKENS:
                     continue
-                # chunk long docs with overlap instead of dropping them
-                if tc > MAX_TOKENS:
-                    step = MAX_TOKENS - CHUNK_OVERLAP
-                    for start in range(0, tc, step):
-                        chunk_ids = ids[start : start + MAX_TOKENS]
-                        if len(chunk_ids) < MIN_TOKENS:
-                            break
-                        chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True)
-                        ctc = len(chunk_ids)
-                        line = json.dumps({"text": chunk_text}, ensure_ascii=False) + "\n"
-                        if rng.random() < VAL_RATIO:
-                            vf.write(line);  val_tokens   += ctc
-                        else:
-                            tf.write(line);  train_tokens += ctc
-                        written += ctc
-                        docs    += 1
-                else:
-                    line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
+                # Chunk document into variable-length pieces drawn from
+                # SEQ_LENGTH_DIST. Each chunk independently samples its
+                # target length, teaching the model to handle the full
+                # range of context sizes (128 → 4096 tokens).
+                pos = 0
+                while pos < tc:
+                    target_len = rng.choices(_SEQ_LENS, weights=_SEQ_WEIGHTS, k=1)[0]
+                    chunk_ids = ids[pos : pos + target_len]
+                    if len(chunk_ids) < MIN_TOKENS:
+                        break
+                    chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True)
+                    ctc = len(chunk_ids)
+                    line = json.dumps({"text": chunk_text}, ensure_ascii=False) + "\n"
                     if rng.random() < VAL_RATIO:
-                        vf.write(line);  val_tokens   += tc
+                        vf.write(line);  val_tokens   += ctc
                     else:
-                        tf.write(line);  train_tokens += tc
-                    written += tc
+                        tf.write(line);  train_tokens += ctc
+                    written += ctc
                     docs    += 1
+                    # Advance with overlap so chunks share some context
+                    pos += max(1, ctc - CHUNK_OVERLAP)
 
         for text in iter_texts(spec):
             buf.append(text)
