@@ -1,0 +1,133 @@
+
+
+
+    BigCode Open RAIL-M License
+    Version 1.0, August 2022
+    (Modified for BitDiffusion a4.8)
+
+
+    Section I: PREAMBLE
+
+    The BigCode project seeks to develop and maintain large language models
+    for code in an open and responsible manner. This license is designed to
+    enable broad use of model weights derived from or trained on datasets
+    governed by the BigCode OpenRAIL-M license (including StarCoderData),
+    while establishing responsible use obligations.
+
+    This license governs use of the BitDiffusion a4.8 model weights and
+    any derivatives thereof. The model code (source files) is separately
+    licensed under Apache 2.0. Only the trained model weights and
+    derivatives of those weights are subject to this license.
+
+
+    Section II: INTELLECTUAL PROPERTY RIGHTS
+
+    Both copyright and patent grants apply to the Model and its derivatives.
+
+    Grant of Copyright License: Subject to the terms of this license, each
+    Contributor hereby grants you a perpetual, worldwide, non-exclusive,
+    no-charge, royalty-free, irrevocable copyright license to reproduce,
+    prepare derivative works of, publicly display, publicly perform,
+    sublicense, and distribute the Model and such derivative works.
+
+    Grant of Patent License: Subject to the terms of this license, each
+    Contributor hereby grants you a perpetual, worldwide, non-exclusive,
+    no-charge, royalty-free, irrevocable patent license to make, have made,
+    use, offer to sell, sell, import, and otherwise transfer the Model.
+
+
+    Section III: CONDITIONS OF USAGE, DISTRIBUTION AND REDISTRIBUTION
+
+    3.1 - You agree not to use the Model or derivatives of the Model to:
+
+        a. Violate any applicable national, federal, state, local or
+           international law or regulation;
+
+        b. Engage in, promote, incite, facilitate, or assist in the planning
+           or development of activities that present a risk of death or bodily
+           harm to individuals, including use of the Model related to the
+           following: military, warfare, nuclear industries or applications,
+           espionage, or other activities with a substantial risk of human
+           casualties;
+
+        c. Intentionally deceive or mislead users;
+
+        d. Generate or disseminate information that creates conditions likely
+           to lead to serious physical or psychological harm;
+
+        e. Generate or disseminate personal identifiable information that can
+           be used to harm an individual;
+
+        f. Defame, disparage or otherwise harass others;
+
+        g. Generate or facilitate false online engagement, including fake
+           reviews and other means of fake online engagement;
+
+        h. Impersonate or attempt to impersonate (e.g. deepfakes) a real
+           person without explicit consent;
+
+        i. Fully automate decision-making processes in contexts where such
+           automation poses a significant risk of harm (e.g. criminal
+           sentencing, medical diagnosis without human review);
+
+        j. Create, distribute or facilitate the creation or distribution of
+           content that sexually exploits minors.
+
+    3.2 - If you distribute the Model or any derivative works, you must:
+
+        a. Provide a copy of this license with the distribution;
+
+        b. Prominently display the following notice:
+           "This model is licensed under the BigCode OpenRAIL-M License.
+            Use restrictions apply. See LICENSE for details.";
+
+        c. Retain all copyright, patent, trademark, and attribution notices
+           from the source Model.
+
+    3.3 - You may add your own copyright statement for your modifications and
+    may provide additional or different license terms for use, reproduction,
+    or distribution of your modifications, provided your use of the Model
+    otherwise complies with this license.
+
+
+    Section IV: DISCLAIMER OF WARRANTY
+
+    Unless required by applicable law or agreed to in writing, the Model is
+    provided "AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+    express or implied, including, without limitation, any warranties or
+    conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR
+    A PARTICULAR PURPOSE. You are solely responsible for determining the
+    appropriateness of using or redistributing the Model and assume any
+    risks associated with your use.
+
+
+    Section V: LIMITATION OF LIABILITY
+
+    In no event and under no legal theory, whether in tort (including
+    negligence), contract, or otherwise, unless required by applicable law,
+    shall any contributor be liable for damages, including any direct,
+    indirect, special, incidental, or exemplary damages of any character
+    arising as a result of this license or out of the use or inability to
+    use the Model, even if such contributor has been advised of the
+    possibility of such damages.
+
+
+    Section VI: CITATION
+
+    If you use this model in research, please cite:
+
+        BitDiffusion a4.8 — Masked diffusion language model with ternary
+        weights and hybrid 4-bit/8-bit activation quantization.
+        https://github.com/fury7425/bitdiffusion-a4.8
+
+
+    -----------------------------------------------------------------------
+    NOTE ON MODEL CODE (SOURCE FILES)
+    -----------------------------------------------------------------------
+    The source code in this repository (all .py files) is licensed under
+    the Apache License, Version 2.0. You may obtain a copy at:
+    http://www.apache.org/licenses/LICENSE-2.0
+
+    Only trained model weights and derivatives of those weights are subject
+    to the BigCode OpenRAIL-M terms above.
+    -----------------------------------------------------------------------
