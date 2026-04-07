@@ -302,7 +302,7 @@ class ThinkingDiffusionSampler:
         think_steps: int = 10,
         answer_steps: int = 20,
         adaptive_think: bool = False,
-        max_think_steps: int = 64,
+        max_think_steps: int = 128,
         think_change_threshold: float = 0.02,
         think_patience: int = 3,
         temperature: float = 0.9,
@@ -850,7 +850,7 @@ def main() -> None:
     parser.add_argument("--think_steps", type=int, default=10, help="Denoising steps for thinking phase (fixed mode)")
     parser.add_argument("--answer_steps", type=int, default=20, help="Denoising steps for answer phase")
     parser.add_argument("--adaptive_think", action="store_true", help="Adaptively stop thinking when tokens stop changing")
-    parser.add_argument("--max_think_steps", type=int, default=64, help="Hard cap on thinking steps in adaptive mode")
+    parser.add_argument("--max_think_steps", type=int, default=128, help="Hard cap on thinking steps in adaptive mode")
     parser.add_argument("--think_change_threshold", type=float, default=0.02, help="Token change rate below which thinking is considered converged (adaptive mode)")
     parser.add_argument("--think_patience", type=int, default=3, help="Consecutive below-threshold steps before early stopping (adaptive mode)")
 
