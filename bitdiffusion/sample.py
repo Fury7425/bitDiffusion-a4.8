@@ -577,6 +577,8 @@ class BlockDiffusionSampler:
         verbose: bool = False,
         seed: int = 42,
         device: torch.device = torch.device("cpu"),
+        auto_length: bool = False,
+        max_length: int = 2048,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -589,6 +591,10 @@ class BlockDiffusionSampler:
         self.verbose = verbose
         self.seed = seed
         self.device = device
+        self.auto_length = auto_length
+        self.max_length = max_length
+        # Resolve EOS token ID from tokenizer
+        self.eos_token_id: Optional[int] = getattr(tokenizer, "eos_token_id", None)
 
     def _sample_masked(
         self,
@@ -703,18 +709,28 @@ class BlockDiffusionSampler:
     ) -> list[dict[str, str]]:
         """Generate text using block-wise diffusion with quantized KV cache.
 
+        When ``auto_length=True`` (set on the sampler), generation stops as
+        soon as an EOS token appears in a completed block. The model naturally
+        decides how long the response should be — short prompts get short
+        answers, complex ones get longer answers. A hard cap of
+        ``max_length`` tokens prevents runaway generation.
+
         Args:
             prompt: Optional conditioning prompt prefix.
-            gen_length: Total answer tokens to generate.
+            gen_length: Total tokens to generate (ignored when
+                ``auto_length=True``, which uses ``max_length`` instead).
             num_samples: Number of independent samples.
 
         Returns:
-            List of dicts with ``"text"`` and optionally ``"blocks"`` keys.
+            List of dicts with ``"text"`` and ``"blocks"`` keys.
         """
         self.model.eval()
         config = self.model.config
         mask_token_id = config.mask_token_id
         vocab_size = config.vocab_size
+
+        # In auto_length mode ignore gen_length, use max_length as the cap
+        effective_max = self.max_length if self.auto_length else gen_length
 
         gen = torch.Generator(device=self.device).manual_seed(self.seed)
 
@@ -738,22 +754,24 @@ class BlockDiffusionSampler:
             prompt_batch = prompt_tensor.unsqueeze(0).expand(num_samples, -1)
             self._commit_block(prompt_batch, kv_cache, rope_offset=0)
 
-        # Divide generation into blocks
-        n_blocks = max(1, (gen_length + self.block_size - 1) // self.block_size)
-        all_generated = []
-        block_texts = []
+        # Divide generation into blocks (capped at effective_max)
+        n_blocks = max(1, (effective_max + self.block_size - 1) // self.block_size)
+        all_generated: list[int] = []
+        block_texts: list[str] = []
         current_offset = prefix_len
+        eos_hit = False
 
         for block_idx in range(n_blocks):
-            remaining = gen_length - len(all_generated)
+            remaining = effective_max - len(all_generated)
             this_block_size = min(self.block_size, remaining)
             if this_block_size <= 0:
                 break
 
             if self.verbose:
+                mode = "auto" if self.auto_length else f"{n_blocks} blocks"
                 logger.info(
-                    "=== Block %d/%d (offset=%d, size=%d) ===",
-                    block_idx + 1, n_blocks, current_offset, this_block_size,
+                    "=== Block %d/%s (offset=%d, size=%d) ===",
+                    block_idx + 1, mode, current_offset, this_block_size,
                 )
 
             # --- Per-block thinking phase (optional) ---
@@ -768,7 +786,6 @@ class BlockDiffusionSampler:
                     think_ids, kv_cache, rope_offset=current_offset,
                     n_steps=self.think_steps, gen=gen,
                 )
-                # Commit thinking tokens to cache
                 self._commit_block(think_ids, kv_cache, rope_offset=current_offset)
                 current_offset += self.think_tokens
 
@@ -788,22 +805,36 @@ class BlockDiffusionSampler:
             self._commit_block(block_ids, kv_cache, rope_offset=current_offset)
             current_offset += this_block_size
 
-            # Collect results
-            clamped = block_ids[0].clamp(0, vocab_size - 1)
-            block_text = self.tokenizer.decode(clamped.tolist(), skip_special_tokens=True)
+            # Collect block tokens
+            block_token_list = block_ids[0].tolist()
+
+            # Auto-length: check for EOS in this block and truncate there
+            if self.auto_length and self.eos_token_id is not None:
+                for pos, tok in enumerate(block_token_list):
+                    if tok == self.eos_token_id:
+                        block_token_list = block_token_list[:pos]  # truncate at EOS
+                        eos_hit = True
+                        if self.verbose:
+                            logger.info("  [auto_length] EOS at block %d pos %d — stopping",
+                                        block_idx + 1, pos)
+                        break
+
+            clamped = [min(t, vocab_size - 1) for t in block_token_list]
+            block_text = self.tokenizer.decode(clamped, skip_special_tokens=True)
             block_texts.append(block_text)
-            all_generated.extend(block_ids[0].tolist())
+            all_generated.extend(block_token_list)
 
             if self.verbose:
                 logger.info("  committed: %s", block_text[:200])
 
+            if eos_hit:
+                break
+
         # Final decode per sample
         results = []
         for b in range(num_samples):
-            # Re-decode all generated tokens for this sample
-            final_ids = torch.tensor(all_generated[:gen_length], dtype=torch.long)
-            final_ids = final_ids.clamp(0, vocab_size - 1)
-            text = self.tokenizer.decode(final_ids.tolist(), skip_special_tokens=True)
+            final_ids = [min(t, vocab_size - 1) for t in all_generated]
+            text = self.tokenizer.decode(final_ids, skip_special_tokens=True)
             results.append({"text": text, "blocks": block_texts})
 
         return results
@@ -865,6 +896,10 @@ def main() -> None:
         "--block_think_tokens", type=int, default=0,
         help="Per-block thinking tokens in block diffusion (0=disabled, try 32-64)",
     )
+    parser.add_argument("--auto_length", action="store_true",
+        help="Stop generating when EOS token appears — model decides response length automatically")
+    parser.add_argument("--max_length", type=int, default=2048,
+        help="Hard cap on total tokens when --auto_length is enabled")
 
     # MoE args
     parser.add_argument("--use_moe", action="store_true", help="Enable MoE FFN layers")
@@ -910,6 +945,8 @@ def main() -> None:
             think_tokens=args.block_think_tokens,
             think_steps=args.think_steps,
             temperature=args.temperature,
+            auto_length=args.auto_length,
+            max_length=args.max_length,
             top_p=args.top_p,
             verbose=args.verbose,
             seed=args.seed,
