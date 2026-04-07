@@ -258,8 +258,14 @@ class ThinkingDiffusionSampler:
     """Two-phase diffusion sampler with latent scratchpad thinking tokens.
 
     Phase 1 (thinking): Denoise only the [THINK] positions while answer
-    positions remain fully masked and frozen. After ``think_steps`` steps
-    the thinking tokens are committed.
+    positions remain fully masked and frozen. After thinking converges (or
+    ``max_think_steps`` is reached) the thinking tokens are committed.
+
+    Adaptive thinking: when ``adaptive_think=True`` the thinking phase runs
+    until the fraction of thinking tokens that change between consecutive
+    steps drops below ``think_change_threshold`` for ``think_patience``
+    steps in a row, indicating the scratchpad has stabilised. This removes
+    the need to set a fixed ``think_steps`` budget.
 
     Phase 2 (answer): Denoise only the answer positions, attending to the
     committed thinking tokens as additional context.
@@ -268,8 +274,19 @@ class ThinkingDiffusionSampler:
         model: Trained BitDiffusionTransformer.
         tokenizer: HuggingFace-compatible tokenizer.
         n_think: Number of thinking token positions.
-        think_steps: Denoising steps for the thinking phase.
+        think_steps: Fixed denoising steps for thinking (used when
+            ``adaptive_think=False``).
         answer_steps: Denoising steps for the answer phase.
+        adaptive_think: If True, run thinking until convergence instead of
+            a fixed number of steps.
+        max_think_steps: Hard cap on thinking steps when adaptive (default
+            64 — prevents infinite loops on pathological inputs).
+        think_change_threshold: Fraction of thinking tokens that must
+            change between steps to be considered "not converged". When the
+            change rate drops below this value for ``think_patience``
+            consecutive steps, thinking stops early (default 0.02 = 2%).
+        think_patience: Number of consecutive below-threshold steps before
+            early stopping triggers (default 3).
         temperature: Sampling temperature.
         top_p: Nucleus sampling threshold.
         verbose: Print intermediate results.
@@ -284,6 +301,10 @@ class ThinkingDiffusionSampler:
         n_think: int = 64,
         think_steps: int = 10,
         answer_steps: int = 20,
+        adaptive_think: bool = False,
+        max_think_steps: int = 128,
+        think_change_threshold: float = 0.02,
+        think_patience: int = 3,
         temperature: float = 0.9,
         top_p: float = 0.95,
         verbose: bool = False,
@@ -295,6 +316,10 @@ class ThinkingDiffusionSampler:
         self.n_think = n_think
         self.think_steps = think_steps
         self.answer_steps = answer_steps
+        self.adaptive_think = adaptive_think
+        self.max_think_steps = max_think_steps
+        self.think_change_threshold = think_change_threshold
+        self.think_patience = think_patience
         self.temperature = temperature
         self.top_p = top_p
         self.verbose = verbose
@@ -366,18 +391,27 @@ class ThinkingDiffusionSampler:
         )
 
         # --- Phase 1: Thinking ---
+        total_think_steps = self.max_think_steps if self.adaptive_think else self.think_steps
         if self.verbose:
-            logger.info("=== Phase 1: Thinking (%d steps) ===", self.think_steps)
+            mode = f"adaptive (max={total_think_steps})" if self.adaptive_think else f"fixed ({total_think_steps} steps)"
+            logger.info("=== Phase 1: Thinking [%s] ===", mode)
 
-        t_steps_think = torch.linspace(1.0, 0.0, self.think_steps + 1, device=self.device)
+        t_steps_think = torch.linspace(1.0, 0.0, total_think_steps + 1, device=self.device)
 
-        for step_idx in range(self.think_steps):
+        # Adaptive convergence tracking
+        _patience_counter = 0
+        _prev_think_ids: Optional[torch.Tensor] = None
+
+        for step_idx in range(total_think_steps):
             t_curr = t_steps_think[step_idx]
             t_next = t_steps_think[step_idx + 1]
 
             kv_cache.reset()
             t_input = t_curr.expand(num_samples)
             logits, _ = self.model(ids, t_input, kv_cache=kv_cache)
+
+            # Snapshot before sampling for change-rate measurement
+            prev_slice = ids[:, think_start:think_end].clone()
 
             # Sample at thinking positions that are masked (batched)
             think_is_masked = (ids[:, think_start:think_end] == mask_token_id)  # (B, n_think)
@@ -406,9 +440,34 @@ class ThinkingDiffusionSampler:
                     n_masked = (ids[b, think_start:think_end] == mask_token_id).sum().item()
                     logger.info(
                         "Think step %d/%d (t=%.3f→%.3f, masked=%d): %s",
-                        step_idx + 1, self.think_steps, t_curr.item(), t_next.item(),
+                        step_idx + 1, total_think_steps, t_curr.item(), t_next.item(),
                         n_masked, text[:200],
                     )
+
+            # Adaptive early stopping: measure token change rate after re-masking
+            if self.adaptive_think and _prev_think_ids is not None:
+                # Compare unmasked tokens only — masked positions always "differ"
+                curr_slice = ids[:, think_start:think_end]
+                both_unmasked = (prev_slice != mask_token_id) & (curr_slice != mask_token_id)
+                n_unmasked = both_unmasked.sum().item()
+                if n_unmasked > 0:
+                    n_changed = ((prev_slice != curr_slice) & both_unmasked).sum().item()
+                    change_rate = n_changed / n_unmasked
+                    if self.verbose:
+                        logger.info("  [adaptive] change_rate=%.3f (threshold=%.3f, patience=%d/%d)",
+                                    change_rate, self.think_change_threshold,
+                                    _patience_counter + 1, self.think_patience)
+                    if change_rate < self.think_change_threshold:
+                        _patience_counter += 1
+                        if _patience_counter >= self.think_patience:
+                            if self.verbose:
+                                logger.info("  [adaptive] thinking converged at step %d/%d",
+                                            step_idx + 1, total_think_steps)
+                            break
+                    else:
+                        _patience_counter = 0
+
+            _prev_think_ids = ids[:, think_start:think_end].clone()
 
         # Commit thinking tokens — freeze them
         frozen[:, think_start:think_end] = True
@@ -518,6 +577,8 @@ class BlockDiffusionSampler:
         verbose: bool = False,
         seed: int = 42,
         device: torch.device = torch.device("cpu"),
+        auto_length: bool = False,
+        max_length: int = 2048,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -530,6 +591,10 @@ class BlockDiffusionSampler:
         self.verbose = verbose
         self.seed = seed
         self.device = device
+        self.auto_length = auto_length
+        self.max_length = max_length
+        # Resolve EOS token ID from tokenizer
+        self.eos_token_id: Optional[int] = getattr(tokenizer, "eos_token_id", None)
 
     def _sample_masked(
         self,
@@ -644,18 +709,28 @@ class BlockDiffusionSampler:
     ) -> list[dict[str, str]]:
         """Generate text using block-wise diffusion with quantized KV cache.
 
+        When ``auto_length=True`` (set on the sampler), generation stops as
+        soon as an EOS token appears in a completed block. The model naturally
+        decides how long the response should be — short prompts get short
+        answers, complex ones get longer answers. A hard cap of
+        ``max_length`` tokens prevents runaway generation.
+
         Args:
             prompt: Optional conditioning prompt prefix.
-            gen_length: Total answer tokens to generate.
+            gen_length: Total tokens to generate (ignored when
+                ``auto_length=True``, which uses ``max_length`` instead).
             num_samples: Number of independent samples.
 
         Returns:
-            List of dicts with ``"text"`` and optionally ``"blocks"`` keys.
+            List of dicts with ``"text"`` and ``"blocks"`` keys.
         """
         self.model.eval()
         config = self.model.config
         mask_token_id = config.mask_token_id
         vocab_size = config.vocab_size
+
+        # In auto_length mode ignore gen_length, use max_length as the cap
+        effective_max = self.max_length if self.auto_length else gen_length
 
         gen = torch.Generator(device=self.device).manual_seed(self.seed)
 
@@ -679,22 +754,24 @@ class BlockDiffusionSampler:
             prompt_batch = prompt_tensor.unsqueeze(0).expand(num_samples, -1)
             self._commit_block(prompt_batch, kv_cache, rope_offset=0)
 
-        # Divide generation into blocks
-        n_blocks = max(1, (gen_length + self.block_size - 1) // self.block_size)
-        all_generated = []
-        block_texts = []
+        # Divide generation into blocks (capped at effective_max)
+        n_blocks = max(1, (effective_max + self.block_size - 1) // self.block_size)
+        all_generated: list[int] = []
+        block_texts: list[str] = []
         current_offset = prefix_len
+        eos_hit = False
 
         for block_idx in range(n_blocks):
-            remaining = gen_length - len(all_generated)
+            remaining = effective_max - len(all_generated)
             this_block_size = min(self.block_size, remaining)
             if this_block_size <= 0:
                 break
 
             if self.verbose:
+                mode = "auto" if self.auto_length else f"{n_blocks} blocks"
                 logger.info(
-                    "=== Block %d/%d (offset=%d, size=%d) ===",
-                    block_idx + 1, n_blocks, current_offset, this_block_size,
+                    "=== Block %d/%s (offset=%d, size=%d) ===",
+                    block_idx + 1, mode, current_offset, this_block_size,
                 )
 
             # --- Per-block thinking phase (optional) ---
@@ -709,7 +786,6 @@ class BlockDiffusionSampler:
                     think_ids, kv_cache, rope_offset=current_offset,
                     n_steps=self.think_steps, gen=gen,
                 )
-                # Commit thinking tokens to cache
                 self._commit_block(think_ids, kv_cache, rope_offset=current_offset)
                 current_offset += self.think_tokens
 
@@ -729,22 +805,36 @@ class BlockDiffusionSampler:
             self._commit_block(block_ids, kv_cache, rope_offset=current_offset)
             current_offset += this_block_size
 
-            # Collect results
-            clamped = block_ids[0].clamp(0, vocab_size - 1)
-            block_text = self.tokenizer.decode(clamped.tolist(), skip_special_tokens=True)
+            # Collect block tokens
+            block_token_list = block_ids[0].tolist()
+
+            # Auto-length: check for EOS in this block and truncate there
+            if self.auto_length and self.eos_token_id is not None:
+                for pos, tok in enumerate(block_token_list):
+                    if tok == self.eos_token_id:
+                        block_token_list = block_token_list[:pos]  # truncate at EOS
+                        eos_hit = True
+                        if self.verbose:
+                            logger.info("  [auto_length] EOS at block %d pos %d — stopping",
+                                        block_idx + 1, pos)
+                        break
+
+            clamped = [min(t, vocab_size - 1) for t in block_token_list]
+            block_text = self.tokenizer.decode(clamped, skip_special_tokens=True)
             block_texts.append(block_text)
-            all_generated.extend(block_ids[0].tolist())
+            all_generated.extend(block_token_list)
 
             if self.verbose:
                 logger.info("  committed: %s", block_text[:200])
 
+            if eos_hit:
+                break
+
         # Final decode per sample
         results = []
         for b in range(num_samples):
-            # Re-decode all generated tokens for this sample
-            final_ids = torch.tensor(all_generated[:gen_length], dtype=torch.long)
-            final_ids = final_ids.clamp(0, vocab_size - 1)
-            text = self.tokenizer.decode(final_ids.tolist(), skip_special_tokens=True)
+            final_ids = [min(t, vocab_size - 1) for t in all_generated]
+            text = self.tokenizer.decode(final_ids, skip_special_tokens=True)
             results.append({"text": text, "blocks": block_texts})
 
         return results
@@ -788,8 +878,12 @@ def main() -> None:
         help="Enable thinking token generation for legacy checkpoints without embedded model_config",
     )
     parser.add_argument("--n_think", type=int, default=64, help="Number of thinking token positions")
-    parser.add_argument("--think_steps", type=int, default=10, help="Denoising steps for thinking phase")
+    parser.add_argument("--think_steps", type=int, default=10, help="Denoising steps for thinking phase (fixed mode)")
     parser.add_argument("--answer_steps", type=int, default=20, help="Denoising steps for answer phase")
+    parser.add_argument("--adaptive_think", action="store_true", help="Adaptively stop thinking when tokens stop changing")
+    parser.add_argument("--max_think_steps", type=int, default=128, help="Hard cap on thinking steps in adaptive mode")
+    parser.add_argument("--think_change_threshold", type=float, default=0.02, help="Token change rate below which thinking is considered converged (adaptive mode)")
+    parser.add_argument("--think_patience", type=int, default=3, help="Consecutive below-threshold steps before early stopping (adaptive mode)")
 
     # Block diffusion args
     parser.add_argument(
@@ -802,6 +896,10 @@ def main() -> None:
         "--block_think_tokens", type=int, default=0,
         help="Per-block thinking tokens in block diffusion (0=disabled, try 32-64)",
     )
+    parser.add_argument("--auto_length", action="store_true",
+        help="Stop generating when EOS token appears — model decides response length automatically")
+    parser.add_argument("--max_length", type=int, default=2048,
+        help="Hard cap on total tokens when --auto_length is enabled")
 
     # MoE args
     parser.add_argument("--use_moe", action="store_true", help="Enable MoE FFN layers")
@@ -847,6 +945,8 @@ def main() -> None:
             think_tokens=args.block_think_tokens,
             think_steps=args.think_steps,
             temperature=args.temperature,
+            auto_length=args.auto_length,
+            max_length=args.max_length,
             top_p=args.top_p,
             verbose=args.verbose,
             seed=args.seed,
@@ -878,6 +978,10 @@ def main() -> None:
             n_think=model.config.N_think,
             think_steps=args.think_steps,
             answer_steps=args.answer_steps,
+            adaptive_think=args.adaptive_think,
+            max_think_steps=args.max_think_steps,
+            think_change_threshold=args.think_change_threshold,
+            think_patience=args.think_patience,
             temperature=args.temperature,
             top_p=args.top_p,
             verbose=args.verbose,
