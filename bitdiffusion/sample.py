@@ -258,8 +258,14 @@ class ThinkingDiffusionSampler:
     """Two-phase diffusion sampler with latent scratchpad thinking tokens.
 
     Phase 1 (thinking): Denoise only the [THINK] positions while answer
-    positions remain fully masked and frozen. After ``think_steps`` steps
-    the thinking tokens are committed.
+    positions remain fully masked and frozen. After thinking converges (or
+    ``max_think_steps`` is reached) the thinking tokens are committed.
+
+    Adaptive thinking: when ``adaptive_think=True`` the thinking phase runs
+    until the fraction of thinking tokens that change between consecutive
+    steps drops below ``think_change_threshold`` for ``think_patience``
+    steps in a row, indicating the scratchpad has stabilised. This removes
+    the need to set a fixed ``think_steps`` budget.
 
     Phase 2 (answer): Denoise only the answer positions, attending to the
     committed thinking tokens as additional context.
@@ -268,8 +274,19 @@ class ThinkingDiffusionSampler:
         model: Trained BitDiffusionTransformer.
         tokenizer: HuggingFace-compatible tokenizer.
         n_think: Number of thinking token positions.
-        think_steps: Denoising steps for the thinking phase.
+        think_steps: Fixed denoising steps for thinking (used when
+            ``adaptive_think=False``).
         answer_steps: Denoising steps for the answer phase.
+        adaptive_think: If True, run thinking until convergence instead of
+            a fixed number of steps.
+        max_think_steps: Hard cap on thinking steps when adaptive (default
+            64 — prevents infinite loops on pathological inputs).
+        think_change_threshold: Fraction of thinking tokens that must
+            change between steps to be considered "not converged". When the
+            change rate drops below this value for ``think_patience``
+            consecutive steps, thinking stops early (default 0.02 = 2%).
+        think_patience: Number of consecutive below-threshold steps before
+            early stopping triggers (default 3).
         temperature: Sampling temperature.
         top_p: Nucleus sampling threshold.
         verbose: Print intermediate results.
@@ -284,6 +301,10 @@ class ThinkingDiffusionSampler:
         n_think: int = 64,
         think_steps: int = 10,
         answer_steps: int = 20,
+        adaptive_think: bool = False,
+        max_think_steps: int = 64,
+        think_change_threshold: float = 0.02,
+        think_patience: int = 3,
         temperature: float = 0.9,
         top_p: float = 0.95,
         verbose: bool = False,
@@ -295,6 +316,10 @@ class ThinkingDiffusionSampler:
         self.n_think = n_think
         self.think_steps = think_steps
         self.answer_steps = answer_steps
+        self.adaptive_think = adaptive_think
+        self.max_think_steps = max_think_steps
+        self.think_change_threshold = think_change_threshold
+        self.think_patience = think_patience
         self.temperature = temperature
         self.top_p = top_p
         self.verbose = verbose
@@ -366,18 +391,27 @@ class ThinkingDiffusionSampler:
         )
 
         # --- Phase 1: Thinking ---
+        total_think_steps = self.max_think_steps if self.adaptive_think else self.think_steps
         if self.verbose:
-            logger.info("=== Phase 1: Thinking (%d steps) ===", self.think_steps)
+            mode = f"adaptive (max={total_think_steps})" if self.adaptive_think else f"fixed ({total_think_steps} steps)"
+            logger.info("=== Phase 1: Thinking [%s] ===", mode)
 
-        t_steps_think = torch.linspace(1.0, 0.0, self.think_steps + 1, device=self.device)
+        t_steps_think = torch.linspace(1.0, 0.0, total_think_steps + 1, device=self.device)
 
-        for step_idx in range(self.think_steps):
+        # Adaptive convergence tracking
+        _patience_counter = 0
+        _prev_think_ids: Optional[torch.Tensor] = None
+
+        for step_idx in range(total_think_steps):
             t_curr = t_steps_think[step_idx]
             t_next = t_steps_think[step_idx + 1]
 
             kv_cache.reset()
             t_input = t_curr.expand(num_samples)
             logits, _ = self.model(ids, t_input, kv_cache=kv_cache)
+
+            # Snapshot before sampling for change-rate measurement
+            prev_slice = ids[:, think_start:think_end].clone()
 
             # Sample at thinking positions that are masked (batched)
             think_is_masked = (ids[:, think_start:think_end] == mask_token_id)  # (B, n_think)
@@ -406,9 +440,34 @@ class ThinkingDiffusionSampler:
                     n_masked = (ids[b, think_start:think_end] == mask_token_id).sum().item()
                     logger.info(
                         "Think step %d/%d (t=%.3f→%.3f, masked=%d): %s",
-                        step_idx + 1, self.think_steps, t_curr.item(), t_next.item(),
+                        step_idx + 1, total_think_steps, t_curr.item(), t_next.item(),
                         n_masked, text[:200],
                     )
+
+            # Adaptive early stopping: measure token change rate after re-masking
+            if self.adaptive_think and _prev_think_ids is not None:
+                # Compare unmasked tokens only — masked positions always "differ"
+                curr_slice = ids[:, think_start:think_end]
+                both_unmasked = (prev_slice != mask_token_id) & (curr_slice != mask_token_id)
+                n_unmasked = both_unmasked.sum().item()
+                if n_unmasked > 0:
+                    n_changed = ((prev_slice != curr_slice) & both_unmasked).sum().item()
+                    change_rate = n_changed / n_unmasked
+                    if self.verbose:
+                        logger.info("  [adaptive] change_rate=%.3f (threshold=%.3f, patience=%d/%d)",
+                                    change_rate, self.think_change_threshold,
+                                    _patience_counter + 1, self.think_patience)
+                    if change_rate < self.think_change_threshold:
+                        _patience_counter += 1
+                        if _patience_counter >= self.think_patience:
+                            if self.verbose:
+                                logger.info("  [adaptive] thinking converged at step %d/%d",
+                                            step_idx + 1, total_think_steps)
+                            break
+                    else:
+                        _patience_counter = 0
+
+            _prev_think_ids = ids[:, think_start:think_end].clone()
 
         # Commit thinking tokens — freeze them
         frozen[:, think_start:think_end] = True
@@ -788,8 +847,12 @@ def main() -> None:
         help="Enable thinking token generation for legacy checkpoints without embedded model_config",
     )
     parser.add_argument("--n_think", type=int, default=64, help="Number of thinking token positions")
-    parser.add_argument("--think_steps", type=int, default=10, help="Denoising steps for thinking phase")
+    parser.add_argument("--think_steps", type=int, default=10, help="Denoising steps for thinking phase (fixed mode)")
     parser.add_argument("--answer_steps", type=int, default=20, help="Denoising steps for answer phase")
+    parser.add_argument("--adaptive_think", action="store_true", help="Adaptively stop thinking when tokens stop changing")
+    parser.add_argument("--max_think_steps", type=int, default=64, help="Hard cap on thinking steps in adaptive mode")
+    parser.add_argument("--think_change_threshold", type=float, default=0.02, help="Token change rate below which thinking is considered converged (adaptive mode)")
+    parser.add_argument("--think_patience", type=int, default=3, help="Consecutive below-threshold steps before early stopping (adaptive mode)")
 
     # Block diffusion args
     parser.add_argument(
@@ -878,6 +941,10 @@ def main() -> None:
             n_think=model.config.N_think,
             think_steps=args.think_steps,
             answer_steps=args.answer_steps,
+            adaptive_think=args.adaptive_think,
+            max_think_steps=args.max_think_steps,
+            think_change_threshold=args.think_change_threshold,
+            think_patience=args.think_patience,
             temperature=args.temperature,
             top_p=args.top_p,
             verbose=args.verbose,
