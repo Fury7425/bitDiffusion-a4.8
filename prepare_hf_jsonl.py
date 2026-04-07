@@ -71,24 +71,35 @@ TOKENIZER_NAME = "Qwen/Qwen-tokenizer"
 VAL_RATIO      = 0.005   # 0.5% val — plenty of data, keep val small
 SEED           = 42
 MIN_TOKENS     = 64
-MAX_TOKENS     = 4096    # hard cap — matches model max_seq_len
+MAX_TOKENS     = 8192    # hard cap — matches model max_seq_len
 CHUNK_OVERLAP  = 128     # overlap between chunks when splitting long docs
 BATCH_SIZE     = 128     # batch tokenisation — much faster than one-at-a-time
 SHUFFLE_BUCKET = 500_000 # lines held in memory during streaming shuffle
 
 # Variable sequence length distribution.
 # Teaches the model to handle short AND long contexts rather than always
-# seeing full 4096-token sequences. Weighted toward longer sequences so
+# seeing full 8192-token sequences. Weighted toward longer sequences so
 # the model gets good long-context training, but sees enough short ones
 # to handle "hi → hi, how are you?" style responses cleanly.
+#
+# Distribution rationale:
+#   128  —  5%  short conversational turns, single sentences
+#   256  —  8%  short paragraphs, brief answers
+#   512  — 10%  multi-sentence answers, small code snippets
+#  1024  — 15%  full paragraphs, short articles
+#  2048  — 20%  multi-paragraph, standard doc length
+#  4096  — 22%  long articles, reasoning chains
+#  8192  — 20%  full ARC grids, long documents, deep reasoning
+#
 # Format: (seq_len, relative_weight)
 SEQ_LENGTH_DIST = [
-    (128,  5),
-    (256,  8),
-    (512,  12),
-    (1024, 20),
-    (2048, 25),
-    (4096, 30),
+    (128,   5),
+    (256,   8),
+    (512,  10),
+    (1024, 15),
+    (2048, 20),
+    (4096, 22),
+    (8192, 20),
 ]
 _SEQ_LENS    = [l for l, _ in SEQ_LENGTH_DIST]
 _SEQ_WEIGHTS = [w for _, w in SEQ_LENGTH_DIST]
