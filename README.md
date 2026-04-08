@@ -181,18 +181,6 @@ Stage 1 lets ternary weights converge under a less aggressive quantization
 regime. Stage 2 fine-tunes under the exact target inference quantization.
 Adjust with `--a4_warmup_fraction`.
 
-### Hardware Requirements
-
-| GPU | VRAM | Fits? | Notes |
-|---|---|---|---|
-| A100 40GB | 40 GB | Yes (29.5 GB) | Recommended |
-| A100 80GB | 80 GB | Yes | Can increase batch |
-| H100 80GB | 80 GB | Yes | ~2.3x faster |
-| L4 24GB | 24 GB | Marginal | Needs 8-bit optimizer |
-| RTX 4090 | 24 GB | Marginal | Inference/fine-tuning only |
-
-**Cloud recommendation:** A100 40GB spot VM on GCP (`a2-highgpu-1g`) at ~$1.10/hr.
-Full 30.1B token run costs approximately $200.
 
 ---
 
