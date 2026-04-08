@@ -75,24 +75,26 @@ class StreamingJsonlDataset(IterableDataset):
         return [p for i, p in enumerate(self.paths) if i % worker_info.num_workers == worker_info.id]
 
     def _produce_chunks(self, files: List[str]) -> Iterator[Dict[str, torch.Tensor]]:
-        """Tokenize and chunk documents into fixed-length sequences."""
-        token_buf: List[int] = []
+        """Tokenize documents as independent examples, preserving per-document boundaries.
 
+        Each JSONL line is treated as one independent example. Documents longer
+        than ``max_length`` are split into non-overlapping chunks, but no tokens
+        ever cross document boundaries.  This preserves the variable-length
+        distribution created by ``prepare_hf_jsonl.py`` (128–4096 token chunks)
+        rather than collapsing everything into fixed-width rolling windows.
+        """
         for doc in self._iter_files(files):
             text = doc.get("text", "")
             if not text:
                 continue
             ids = self.tokenizer.encode(text, add_special_tokens=False)
-            token_buf.extend(ids)
-
-            while len(token_buf) >= self.max_length:
-                chunk = token_buf[: self.max_length]
-                token_buf = token_buf[self.max_length :]
-                yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
-
-        # Emit final partial chunk if reasonably sized
-        if len(token_buf) >= 16:
-            yield {"input_ids": torch.tensor(token_buf[: self.max_length], dtype=torch.long)}
+            if not ids:
+                continue
+            # Split within the document only — no cross-document token bleeding.
+            for start in range(0, len(ids), self.max_length):
+                chunk = ids[start : start + self.max_length]
+                if len(chunk) >= 16:
+                    yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Yield tokenized chunks with an in-memory shuffle buffer.

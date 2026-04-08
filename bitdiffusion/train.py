@@ -77,8 +77,9 @@ class TrainConfig:
     train_data: str = "data/train/*.jsonl"
     val_data: str = "data/val/*.jsonl"
     output_dir: str = "checkpoints"
-    # 57 500 steps × (8 batch × 16 accum × 4096 seq) = 30.1B tokens
-    # batch_size=8 keeps identical 524K tok/step on 40GB A100 (~29.5 GB total).
+    # 57 500 steps × (8 batch × 16 accum × 4096 seq) ≈ 30.1B tokens.
+    # For a 40B-token run set max_steps=76_294 (40e9 / 524_288).
+    # batch_size=8 keeps 524K tok/step on a 40 GB A100 (~29.5 GB total).
     # 4096 context covers all standard benchmarks and beats every published
     # masked diffusion LM. Scale to 8192+ with a multi-GPU cluster.
     max_steps: int = 57500
@@ -114,9 +115,10 @@ class TrainConfig:
     kv_cache_bits: int = 3
     kv_cache_bos_bits: int = 4
 
-    # Thinking tokens
-    N_think: int = 64       # 0 = disabled
-    think_prob: float = 1.0 # always prepend think tokens during training
+    # Thinking tokens — disabled by default for a clean baseline run.
+    # Re-enable only after the base model is proven (see review notes).
+    N_think: int = 0        # 0 = disabled
+    think_prob: float = 0.0
 
     # Mixture of Experts
     use_moe: bool = False
@@ -223,10 +225,14 @@ def validate(
         if i >= max_batches:
             break
         input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)  # (B, T) bool
         B, T = input_ids.shape
 
         t = torch.rand(B, device=device)
-        masked_ids, is_masked = apply_mask(input_ids, t, mask_token_id, schedule)
+        # Exclude padded positions from masking and loss
+        masked_ids, is_masked = apply_mask(
+            input_ids, t, mask_token_id, schedule, frozen_mask=~attention_mask
+        )
 
         with autocast("cuda", dtype=torch.bfloat16):
             logits, _ = model(masked_ids, t)
@@ -285,9 +291,10 @@ def generate_sample(
         t_input = t_curr.unsqueeze(0)  # (1,)
         logits, _ = model(ids, t_input)  # (1, T, V)
 
-        # Sample at masked positions
+        # Sample at masked positions — slice to normal vocab only so that
+        # special tokens (mask, think) cannot be sampled and silently clamped.
         is_masked = (ids == mask_token_id)
-        probs = torch.softmax(logits / temperature, dim=-1)
+        probs = torch.softmax(logits[:, :, :model.config.vocab_size] / temperature, dim=-1)
 
         # Sample from distribution
         flat_probs = probs.view(-1, probs.shape[-1])
@@ -471,6 +478,8 @@ def train(cfg: TrainConfig) -> None:
     logger.info("Starting training for %d steps", cfg.max_steps)
     optimizer.zero_grad(set_to_none=True)
     running_loss = 0.0
+    running_grad_norm = 0.0
+    running_masked_frac = 0.0
     step_in_accum = 0
     epoch = 0
 
@@ -481,6 +490,7 @@ def train(cfg: TrainConfig) -> None:
                 break
 
             input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)  # (B, T) bool
             B, T = input_ids.shape
 
             # Per-sample noise level
@@ -498,9 +508,15 @@ def train(cfg: TrainConfig) -> None:
                 input_ids = torch.cat([think_prefix, input_ids], dim=1)  # (B, N_think + T)
                 T_full = input_ids.shape[1]
                 is_think = think_schedule.is_think_position(T_full, device)  # (T_full,)
+                # Extend attention_mask: think positions are always real tokens
+                think_attn = torch.ones(B, model_cfg.N_think, dtype=torch.bool, device=device)
+                attention_mask = torch.cat([think_attn, attention_mask], dim=1)
 
-            # Mask
-            masked_ids, is_masked = apply_mask(input_ids, t, mask_token_id, schedule)
+            # Mask — exclude padded positions from corruption
+            masked_ids, is_masked = apply_mask(
+                input_ids, t, mask_token_id, schedule, frozen_mask=~attention_mask
+            )
+            running_masked_frac += is_masked.float().mean().item() / cfg.grad_accum_steps
 
             # Forward
             with autocast("cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
@@ -520,7 +536,8 @@ def train(cfg: TrainConfig) -> None:
 
             # Optimizer step
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+            running_grad_norm += float(grad_norm)
             scaler.step(optimizer)
             scaler.update()
             lr_scheduler.step()
@@ -532,6 +549,12 @@ def train(cfg: TrainConfig) -> None:
             # --- Activation mode transition ---
             new_mode = act_schedule.get_mode(global_step)
             if new_mode != current_mode:
+                # Save a checkpoint right at the A8→A4 boundary so you can
+                # ablate whether degradation came from before or after the switch.
+                pre_a4_path = os.path.join(cfg.output_dir, f"step_{global_step}_pre_a4.pt")
+                save_checkpoint(pre_a4_path, model, optimizer, lr_scheduler,
+                                global_step, current_mode)
+                logger.info("Pre-A4 ablation checkpoint saved to %s", pre_a4_path)
                 current_mode = new_mode
                 model.set_activation_mode(current_mode)
                 logger.info("Step %d: activation mode → %s", global_step, current_mode)
@@ -539,19 +562,25 @@ def train(cfg: TrainConfig) -> None:
             # --- Logging ---
             if global_step % 50 == 0:
                 avg_loss = running_loss / 50
+                avg_grad_norm = running_grad_norm / 50
+                avg_masked_frac = running_masked_frac / 50
                 lr = optimizer.param_groups[0]["lr"]
                 logger.info(
-                    "step=%d  loss=%.4f  lr=%.2e  mode=%s",
-                    global_step, avg_loss, lr, current_mode,
+                    "step=%d  loss=%.4f  lr=%.2e  grad_norm=%.3f  masked_frac=%.3f  mode=%s",
+                    global_step, avg_loss, lr, avg_grad_norm, avg_masked_frac, current_mode,
                 )
                 log_data = {
                     "train/loss": avg_loss,
                     "train/lr": lr,
+                    "train/grad_norm": avg_grad_norm,
+                    "train/masked_frac": avg_masked_frac,
                     "train/activation_mode": 0 if current_mode == "A8" else 1,
                     "train/epoch": epoch,
                 }
                 wandb_logger.log(log_data, step=global_step)
                 running_loss = 0.0
+                running_grad_norm = 0.0
+                running_masked_frac = 0.0
 
             # --- MoE load balance loss logging (every 100 steps) ---
             if model_cfg.use_moe and global_step % 100 == 0:

@@ -263,20 +263,24 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(grown_k.shape, (1, 2, 3, 5))
         self.assertEqual(grown_v.shape, (1, 2, 3, 5))
 
-    def test_denoise_resets_kv_cache_every_step(self) -> None:
+    def test_denoise_uses_no_kv_cache(self) -> None:
+        """The full denoiser must not allocate a KV cache.
+
+        Each denoising step reprocesses the full sequence with a new mask
+        pattern, so a cached KV tensor from the previous step is invalid.
+        No cache should be created — doing so was pure overhead with no
+        correctness or speed benefit.
+        """
         import bitdiffusion.sample as sample_module
 
-        class TrackingKVCache(KVCache):
-            instances = []
+        cache_instances: list = []
 
+        original_cache_cls = sample_module.KVCache
+
+        class TrackingKVCache(original_cache_cls):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                self.reset_calls = 0
-                TrackingKVCache.instances.append(self)
-
-            def reset(self) -> None:
-                self.reset_calls += 1
-                super().reset()
+                cache_instances.append(self)
 
         class DummyModel:
             def __init__(self):
@@ -297,7 +301,6 @@ class CompatibilityTests(unittest.TestCase):
                 logits[..., 0] = 1.0
                 return logits, torch.tensor(0.0)
 
-        original_cache_cls = sample_module.KVCache
         sample_module.KVCache = TrackingKVCache
         try:
             results = denoise(
@@ -313,11 +316,11 @@ class CompatibilityTests(unittest.TestCase):
             sample_module.KVCache = original_cache_cls
 
         self.assertEqual(len(results), 1)
-        self.assertEqual(len(TrackingKVCache.instances), 1)
-        cache = TrackingKVCache.instances[0]
-        self.assertEqual(cache.reset_calls, 3)
-        self.assertEqual(cache.default_bits, 3)
-        self.assertEqual(cache.bos_bits, 4)
+        self.assertEqual(
+            len(cache_instances), 0,
+            "denoise() must not allocate a KV cache — each step reprocesses "
+            "the full sequence from scratch.",
+        )
 
 
 if __name__ == "__main__":

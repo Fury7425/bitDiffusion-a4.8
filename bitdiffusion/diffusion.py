@@ -208,5 +208,11 @@ class MaskDiffusionLoss(nn.Module):
         targets_loss = targets_flat.clone()
         targets_loss[~mask_flat] = self.ignore_index
 
+        # Guard: if there are no supervised positions (e.g. all masked positions
+        # were excluded by think tokens or an edge-case batch), cross_entropy
+        # would return NaN.  Return zero loss instead.
+        if not mask_flat.any():
+            return logits.new_zeros(())
+
         loss = F.cross_entropy(logits_flat, targets_loss, ignore_index=self.ignore_index)
         return loss

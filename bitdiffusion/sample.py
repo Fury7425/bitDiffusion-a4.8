@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import time
 from typing import Optional
 
 import torch
@@ -134,9 +135,12 @@ def denoise(
     that is never masked. The rest of the sequence starts fully masked
     at t=1 and is progressively denoised to t=0.
 
-    **KV cache behavior:** The quantized KV cache is active during inference
-    but is **reset at the start of each denoising step**, because each
-    step re-processes the full sequence with a new mask pattern.
+    **No KV cache:** The full denoiser re-processes the entire sequence from
+    scratch at every step because the mask pattern changes at each step.
+    A KV cache from step *i* is invalid at step *i+1* and would need to be
+    reset anyway, so no cache is allocated here.  KV cache reuse only
+    benefits the :class:`BlockDiffusionSampler`, where committed blocks
+    never change between steps.
 
     Args:
         model: Trained BitDiffusionTransformer.
@@ -179,13 +183,6 @@ def denoise(
     if prefix_len > 0:
         frozen[:, :prefix_len] = True
 
-    # Create KV cache
-    kv_cache = KVCache(
-        n_layers=model.config.n_layers,
-        default_bits=model.config.kv_cache_bits,
-        bos_bits=model.config.kv_cache_bos_bits,
-    )
-
     gen = torch.Generator(device=device).manual_seed(seed)
 
     # Denoising schedule: linearly spaced from t=1 to t=0
@@ -195,14 +192,9 @@ def denoise(
         t_curr = t_steps[step_idx]
         t_next = t_steps[step_idx + 1]
 
-        # Reset KV cache at the start of each denoising step.
-        # Each step re-processes the full sequence with the current mask
-        # pattern, so cached KV from a previous mask pattern is invalid.
-        kv_cache.reset()
-
-        # Forward pass
+        # Forward pass — no KV cache; each step reprocesses the full sequence.
         t_input = t_curr.expand(num_samples)
-        logits, _ = model(ids, t_input, kv_cache=kv_cache)  # (B, T, V)
+        logits, _ = model(ids, t_input)  # (B, T, V)
 
         # Identify currently masked positions (excluding frozen prefix)
         is_masked = (ids == mask_token_id)
@@ -756,16 +748,20 @@ class BlockDiffusionSampler:
 
         # Divide generation into blocks (capped at effective_max)
         n_blocks = max(1, (effective_max + self.block_size - 1) // self.block_size)
-        all_generated: list[int] = []
-        block_texts: list[str] = []
+        all_generated: list[list[int]] = [[] for _ in range(num_samples)]
+        block_texts: list[list[str]] = [[] for _ in range(num_samples)]
         current_offset = prefix_len
-        eos_hit = False
+        eos_hit = [False] * num_samples
+
+        block_times: list[float] = []
 
         for block_idx in range(n_blocks):
-            remaining = effective_max - len(all_generated)
+            remaining = effective_max - len(all_generated[0])
             this_block_size = min(self.block_size, remaining)
             if this_block_size <= 0:
                 break
+
+            block_t0 = time.perf_counter()
 
             if self.verbose:
                 mode = "auto" if self.auto_length else f"{n_blocks} blocks"
@@ -805,37 +801,59 @@ class BlockDiffusionSampler:
             self._commit_block(block_ids, kv_cache, rope_offset=current_offset)
             current_offset += this_block_size
 
-            # Collect block tokens
-            block_token_list = block_ids[0].tolist()
+            # Collect block tokens per sample independently
+            for b in range(num_samples):
+                if eos_hit[b]:
+                    continue
+                block_token_list = block_ids[b].tolist()
 
-            # Auto-length: check for EOS in this block and truncate there
-            if self.auto_length and self.eos_token_id is not None:
-                for pos, tok in enumerate(block_token_list):
-                    if tok == self.eos_token_id:
-                        block_token_list = block_token_list[:pos]  # truncate at EOS
-                        eos_hit = True
-                        if self.verbose:
-                            logger.info("  [auto_length] EOS at block %d pos %d — stopping",
-                                        block_idx + 1, pos)
-                        break
+                # Auto-length: check for EOS in this block and truncate there
+                if self.auto_length and self.eos_token_id is not None:
+                    for pos, tok in enumerate(block_token_list):
+                        if tok == self.eos_token_id:
+                            block_token_list = block_token_list[:pos]
+                            eos_hit[b] = True
+                            if self.verbose:
+                                logger.info(
+                                    "  [auto_length] EOS at sample %d block %d pos %d — stopping",
+                                    b, block_idx + 1, pos,
+                                )
+                            break
 
-            clamped = [min(t, vocab_size - 1) for t in block_token_list]
-            block_text = self.tokenizer.decode(clamped, skip_special_tokens=True)
-            block_texts.append(block_text)
-            all_generated.extend(block_token_list)
+                clamped = [min(t, vocab_size - 1) for t in block_token_list]
+                block_text = self.tokenizer.decode(clamped, skip_special_tokens=True)
+                block_texts[b].append(block_text)
+                all_generated[b].extend(block_token_list)
+
+            block_elapsed = time.perf_counter() - block_t0
+            block_times.append(block_elapsed)
 
             if self.verbose:
-                logger.info("  committed: %s", block_text[:200])
+                # Log sample 0 as representative
+                if block_texts[0]:
+                    tok_per_s = this_block_size / max(block_elapsed, 1e-6)
+                    logger.info(
+                        "  committed[0]: %s  [%.2f s, %.0f tok/s]",
+                        block_texts[0][-1][:160], block_elapsed, tok_per_s,
+                    )
 
-            if eos_hit:
+            if all(eos_hit):
                 break
 
         # Final decode per sample
+        total_block_time = sum(block_times)
         results = []
         for b in range(num_samples):
-            final_ids = [min(t, vocab_size - 1) for t in all_generated]
+            final_ids = [min(t, vocab_size - 1) for t in all_generated[b]]
             text = self.tokenizer.decode(final_ids, skip_special_tokens=True)
-            results.append({"text": text, "blocks": block_texts})
+            n_gen = len(all_generated[b])
+            results.append({
+                "text": text,
+                "blocks": block_texts[b],
+                "n_tokens": n_gen,
+                "elapsed_s": total_block_time,
+                "tok_per_s": n_gen / max(total_block_time, 1e-6),
+            })
 
         return results
 
@@ -934,7 +952,8 @@ def main() -> None:
 
     if args.block:
         logger.info(
-            "Block diffusion: %d sample(s), block_size=%d, steps=%d, think_tokens=%d",
+            "Block diffusion: %d sample(s), block_size=%d, steps=%d, think_tokens=%d"
+            "  [KV cache active — committed blocks reused across denoising steps]",
             args.num_samples, args.block_size, args.steps, args.block_think_tokens,
         )
         sampler = BlockDiffusionSampler(
@@ -952,11 +971,13 @@ def main() -> None:
             seed=args.seed,
             device=device,
         )
+        t0 = time.perf_counter()
         results = sampler.generate(
             prompt=args.prompt,
             gen_length=args.length,
             num_samples=args.num_samples,
         )
+        wall_s = time.perf_counter() - t0
 
         print("\n" + "=" * 60)
         for i, result in enumerate(results):
@@ -964,6 +985,15 @@ def main() -> None:
                 print(f"\n--- Sample {i + 1} ---")
             print(result["text"])
         print("=" * 60)
+        # Separate the block-sampler story: report per-sample tok/s so it can
+        # be compared against the full denoiser on an equal footing.
+        avg_tps = sum(r["tok_per_s"] for r in results) / max(len(results), 1)
+        logger.info(
+            "Block sampler: %.2f s total, %.0f tok/s (avg over %d sample(s), "
+            "KV cache reuse across %d block(s) each)",
+            wall_s, avg_tps, args.num_samples,
+            max(1, (args.length + args.block_size - 1) // args.block_size),
+        )
 
     elif args.thinking:
         if model.config.N_think <= 0:
@@ -1005,8 +1035,13 @@ def main() -> None:
                 print(result["answer"])
         print("=" * 60)
     else:
-        logger.info("Generating %d sample(s) with %d denoising steps...", args.num_samples, args.steps)
+        logger.info(
+            "Full denoiser: %d sample(s), %d steps"
+            "  [no KV cache — full sequence re-processed every step]",
+            args.num_samples, args.steps,
+        )
 
+        t0 = time.perf_counter()
         results = denoise(
             model=model,
             tokenizer=tokenizer,
@@ -1020,6 +1055,8 @@ def main() -> None:
             seed=args.seed,
             device=device,
         )
+        wall_s = time.perf_counter() - t0
+        n_tokens = args.num_samples * args.length
 
         print("\n" + "=" * 60)
         for i, text in enumerate(results):
@@ -1027,6 +1064,15 @@ def main() -> None:
                 print(f"\n--- Sample {i + 1} ---")
             print(text)
         print("=" * 60)
+        # Separate the full-denoiser story: tok/s here is steps × seq_len
+        # forward passes, not KV-cache-accelerated — do not conflate with
+        # block-sampler tok/s numbers.
+        logger.info(
+            "Full denoiser: %.2f s, %.0f tok/s  "
+            "(%d steps × %d tokens/step × %d sample(s), no KV reuse)",
+            wall_s, n_tokens / max(wall_s, 1e-6),
+            args.steps, args.length, args.num_samples,
+        )
 
 
 if __name__ == "__main__":
