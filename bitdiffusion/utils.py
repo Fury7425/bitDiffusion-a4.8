@@ -41,6 +41,7 @@ _MODEL_TOPOLOGY_FIELDS = (
     "n_experts",
     "top_k_experts",
     "moe_layers",
+    "use_rdt",
 )
 
 
@@ -270,6 +271,11 @@ def save_checkpoint(
             ckpt["model_config"] = asdict(model.config)
         except Exception:
             logger.warning("Failed to serialize model config into checkpoint metadata")
+    if hasattr(model, "rdt_config"):
+        try:
+            ckpt["rdt_config"] = asdict(model.rdt_config)
+        except Exception:
+            logger.warning("Failed to serialize rdt_config into checkpoint metadata")
     if extra:
         ckpt["extra"] = extra
     torch.save(ckpt, path)
@@ -306,6 +312,7 @@ def load_checkpoint(
         "step": ckpt.get("step", 0),
         "activation_mode": ckpt.get("activation_mode", "A8"),
         "model_config": ckpt.get("model_config"),
+        "rdt_config": ckpt.get("rdt_config"),
         "extra": ckpt.get("extra", {}),
     }
 

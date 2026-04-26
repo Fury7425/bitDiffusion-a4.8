@@ -84,6 +84,9 @@ class ModelConfig:
     aux_loss_weight: float = 0.01
     expert_capacity_factor: float = 1.25
 
+    # --- Recurrent-Depth Transformer (OpenMythos integration) ---
+    use_rdt: bool = False  # discriminator for checkpoint topology validation
+
     # Training efficiency
     gradient_checkpointing: bool = False
 
