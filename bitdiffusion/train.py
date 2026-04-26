@@ -131,6 +131,19 @@ class TrainConfig:
     # Training efficiency
     gradient_checkpointing: bool = True
 
+    # --- Recurrent-Depth Transformer (OpenMythos integration) ---
+    # Set model_type="rdt" to train BitRDTTransformer instead of the standard model.
+    model_type: str = "standard"  # "standard" or "rdt"
+    rdt_prelude_layers: int = 4
+    rdt_recurrent_layers: int = 2
+    rdt_coda_layers: int = 4
+    rdt_max_loop_iters: int = 8
+    rdt_lora_rank: int = 32
+    rdt_loop_dim: int = 64
+    rdt_use_act: bool = True
+    rdt_act_ponder_weight: float = 0.01
+    rdt_randomize_loops: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Activation schedule
@@ -374,7 +387,31 @@ def train(cfg: TrainConfig) -> None:
     )
 
     # Model
-    model = BitDiffusionTransformer(model_cfg).to(device)
+    if cfg.model_type == "rdt":
+        from dataclasses import asdict as _asdict
+        from .rdt import BitRDTTransformer, RDTConfig
+        base = _asdict(model_cfg)
+        base.update(
+            use_rdt=True,
+            prelude_layers=cfg.rdt_prelude_layers,
+            recurrent_layers=cfg.rdt_recurrent_layers,
+            coda_layers=cfg.rdt_coda_layers,
+            max_loop_iters=cfg.rdt_max_loop_iters,
+            lora_rank=cfg.rdt_lora_rank,
+            loop_dim=cfg.rdt_loop_dim,
+            use_act=cfg.rdt_use_act,
+            act_ponder_weight=cfg.rdt_act_ponder_weight,
+            randomize_loops=cfg.rdt_randomize_loops,
+        )
+        rdt_cfg = RDTConfig(**base)
+        model = BitRDTTransformer(rdt_cfg).to(device)
+        logger.info(
+            "BitRDTTransformer: prelude=%d, recurrent=%d, coda=%d, max_loops=%d",
+            cfg.rdt_prelude_layers, cfg.rdt_recurrent_layers,
+            cfg.rdt_coda_layers, cfg.rdt_max_loop_iters,
+        )
+    else:
+        model = BitDiffusionTransformer(model_cfg).to(device)
     param_info = count_parameters(model, model_cfg)
     logger.info("Parameter breakdown: %s", param_info)
 

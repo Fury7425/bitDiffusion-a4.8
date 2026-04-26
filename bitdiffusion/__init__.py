@@ -4,5 +4,6 @@
 """BitDiffusion a4.8 package."""
 
 from .model import BitDiffusionTransformer, ModelConfig
+from .rdt import BitRDTTransformer, RDTConfig
 
-__all__ = ["BitDiffusionTransformer", "ModelConfig"]
+__all__ = ["BitDiffusionTransformer", "ModelConfig", "BitRDTTransformer", "RDTConfig"]

@@ -27,6 +27,13 @@ from .model import BitDiffusionTransformer, ModelConfig
 from .quantization import KVCache
 from .utils import read_checkpoint, resolve_checkpoint_model_config, setup_logging
 
+
+def _model_fwd(model, ids, t, *, kv_cache=None, rope_offset=0, n_loops=None):
+    """Unified model forward that passes n_loops only to BitRDTTransformer."""
+    if n_loops is not None and hasattr(model, "rdt_config"):
+        return model(ids, t, kv_cache=kv_cache, rope_offset=rope_offset, n_loops=n_loops)
+    return model(ids, t, kv_cache=kv_cache, rope_offset=rope_offset)
+
 logger = logging.getLogger("bitdiffusion")
 
 _MOE_LAYER_CHOICES = ("all", "alternate", "alternate_even", "top_half")
@@ -61,7 +68,12 @@ def load_model_from_checkpoint(
     device: torch.device,
     tokenizer=None,
 ) -> tuple[BitDiffusionTransformer, dict, ModelConfig]:
-    """Load a checkpoint and resolve the runtime ``ModelConfig``."""
+    """Load a checkpoint and resolve the runtime ``ModelConfig``.
+
+    Handles both standard ``BitDiffusionTransformer`` and ``BitRDTTransformer``
+    checkpoints: when the checkpoint carries ``rdt_config`` (or when
+    ``config.use_rdt`` is True), the RDT variant is instantiated automatically.
+    """
     ckpt = read_checkpoint(args.checkpoint, device="cpu")
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
@@ -77,7 +89,16 @@ def load_model_from_checkpoint(
     else:
         logger.warning("Checkpoint has no embedded model_config; using CLI fallback arguments")
 
-    model = BitDiffusionTransformer(config).to(device)
+    if config.use_rdt or ckpt.get("rdt_config"):
+        from .rdt import BitRDTTransformer, resolve_rdt_config
+        rdt_cfg = resolve_rdt_config(ckpt)
+        model = BitRDTTransformer(rdt_cfg).to(device)
+        logger.info("Loaded BitRDTTransformer (prelude=%d, recurrent=%d, coda=%d, max_loops=%d)",
+                    rdt_cfg.prelude_layers, rdt_cfg.recurrent_layers,
+                    rdt_cfg.coda_layers, rdt_cfg.max_loop_iters)
+    else:
+        model = BitDiffusionTransformer(config).to(device)
+
     model.load_state_dict(ckpt["model_state_dict"])
     return model, ckpt, config
 
@@ -128,6 +149,7 @@ def denoise(
     verbose: bool = False,
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
+    n_loops: Optional[int] = None,
 ) -> list[str]:
     """Generate text via iterative diffusion denoising.
 
@@ -194,7 +216,7 @@ def denoise(
 
         # Forward pass — no KV cache; each step reprocesses the full sequence.
         t_input = t_curr.expand(num_samples)
-        logits, _ = model(ids, t_input)  # (B, T, V)
+        logits, _ = _model_fwd(model, ids, t_input, n_loops=n_loops)  # (B, T, V)
 
         # Identify currently masked positions (excluding frozen prefix)
         is_masked = (ids == mask_token_id)
@@ -302,6 +324,7 @@ class ThinkingDiffusionSampler:
         verbose: bool = False,
         seed: int = 42,
         device: torch.device = torch.device("cpu"),
+        n_loops: Optional[int] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -317,6 +340,7 @@ class ThinkingDiffusionSampler:
         self.verbose = verbose
         self.seed = seed
         self.device = device
+        self.n_loops = n_loops
 
     @torch.no_grad()
     def generate(
@@ -400,7 +424,8 @@ class ThinkingDiffusionSampler:
 
             kv_cache.reset()
             t_input = t_curr.expand(num_samples)
-            logits, _ = self.model(ids, t_input, kv_cache=kv_cache)
+            logits, _ = _model_fwd(self.model, ids, t_input,
+                                   kv_cache=kv_cache, n_loops=self.n_loops)
 
             # Snapshot before sampling for change-rate measurement
             prev_slice = ids[:, think_start:think_end].clone()
@@ -476,7 +501,8 @@ class ThinkingDiffusionSampler:
 
             kv_cache.reset()
             t_input = t_curr.expand(num_samples)
-            logits, _ = self.model(ids, t_input, kv_cache=kv_cache)
+            logits, _ = _model_fwd(self.model, ids, t_input,
+                                   kv_cache=kv_cache, n_loops=self.n_loops)
 
             # Sample at answer positions that are masked (batched)
             answer_is_masked = (ids[:, answer_start:] == mask_token_id)  # (B, answer_len)
@@ -571,6 +597,7 @@ class BlockDiffusionSampler:
         device: torch.device = torch.device("cpu"),
         auto_length: bool = False,
         max_length: int = 2048,
+        n_loops: Optional[int] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -585,6 +612,7 @@ class BlockDiffusionSampler:
         self.device = device
         self.auto_length = auto_length
         self.max_length = max_length
+        self.n_loops = n_loops
         # Resolve EOS token ID from tokenizer
         self.eos_token_id: Optional[int] = getattr(tokenizer, "eos_token_id", None)
 
@@ -647,7 +675,9 @@ class BlockDiffusionSampler:
             t_next = t_steps[step_idx + 1]
 
             t_input = t_curr.expand(B)
-            logits, _ = self.model(block_ids, t_input, kv_cache=kv_cache, rope_offset=rope_offset)
+            logits, _ = _model_fwd(self.model, block_ids, t_input,
+                                   kv_cache=kv_cache, rope_offset=rope_offset,
+                                   n_loops=self.n_loops)
 
             is_masked = (block_ids == mask_token_id)
             block_ids = self._sample_masked(logits, is_masked, block_ids, gen)
@@ -690,7 +720,9 @@ class BlockDiffusionSampler:
         t_zero = torch.zeros(B, device=self.device)
         kv_cache.ephemeral = False
         with torch.no_grad():
-            self.model(block_ids, t_zero, kv_cache=kv_cache, rope_offset=rope_offset)
+            _model_fwd(self.model, block_ids, t_zero,
+                       kv_cache=kv_cache, rope_offset=rope_offset,
+                       n_loops=self.n_loops)
 
     @torch.no_grad()
     def generate(
@@ -919,6 +951,13 @@ def main() -> None:
     parser.add_argument("--max_length", type=int, default=2048,
         help="Hard cap on total tokens when --auto_length is enabled")
 
+    # RDT args
+    parser.add_argument(
+        "--n_loops", type=int, default=None,
+        help="Recurrence iterations for BitRDTTransformer (None = use checkpoint default). "
+             "Set higher than trained max_loop_iters for inference-time depth extrapolation.",
+    )
+
     # MoE args
     parser.add_argument("--use_moe", action="store_true", help="Enable MoE FFN layers")
     parser.add_argument("--n_experts", type=int, default=8, help="Number of experts")
@@ -970,6 +1009,7 @@ def main() -> None:
             verbose=args.verbose,
             seed=args.seed,
             device=device,
+            n_loops=args.n_loops,
         )
         t0 = time.perf_counter()
         results = sampler.generate(
@@ -1017,6 +1057,7 @@ def main() -> None:
             verbose=args.verbose,
             seed=args.seed,
             device=device,
+            n_loops=args.n_loops,
         )
         results = sampler.generate(
             prompt=args.prompt,
@@ -1054,6 +1095,7 @@ def main() -> None:
             verbose=args.verbose,
             seed=args.seed,
             device=device,
+            n_loops=args.n_loops,
         )
         wall_s = time.perf_counter() - t0
         n_tokens = args.num_samples * args.length
