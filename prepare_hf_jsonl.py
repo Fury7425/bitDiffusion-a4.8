@@ -2,7 +2,7 @@
 # Model weights derived from this code are subject to the BigCode OpenRAIL-M license.
 # Source code is licensed under Apache 2.0. See LICENSE for details.
 """
-BitDiffusion a4.8 — English-only data preparation (~40B tokens)
+BitDiffusion a4.8 — English-only data preparation (~20B tokens)
 
 OUTPUT FORMAT  (matches StreamingJsonlDataset in data.py — do NOT change)
   Each line: {"text": "..."}
@@ -30,32 +30,32 @@ RECOMMENDED TRAINING CONFIGS
     max_steps=76_000 → ~19.9B tokens
 ──────────────────────────────────────────────────────────────────
 
-DATASET MIX  (~40B tokens, English only)
+DATASET MIX  (~20B tokens, English only, no code)
 ┌─────────────────┬──────────────────────────────────────────────────────┬───────┐
 │ Slug            │ Source                                               │Tokens │
 ├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ fineweb_edu     │ HuggingFaceFW/fineweb-edu (sample-100BT)             │  15B  │
+│ fineweb_edu     │ HuggingFaceFW/fineweb-edu (sample-100BT)             │   8B  │
 │                 │ Llama-3-70B scored educational web — gold standard   │       │
 ├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ dclm            │ HuggingFaceFW/dclm_100BT                             │   8B  │
+│ dclm            │ HuggingFaceFW/dclm_100BT                             │   4B  │
 │                 │ Model-filtered CC; beats SlimPajama/RefinedWeb/Dolma │       │
 ├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ open_web_math   │ open-web-math/open-web-math (14.7B total)            │   7B  │
+│ open_web_math   │ open-web-math/open-web-math (14.7B total)            │   3B  │
 │                 │ Best-in-class math/STEM web corpus                   │       │
 ├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ cosmopedia      │ HuggingFaceTB/cosmopedia (~30B total)                │   4B  │
+│ cosmopedia      │ HuggingFaceTB/cosmopedia (~30B total)                │   2B  │
 │                 │ Synthetic textbook/story — strong reasoning signal   │       │
 ├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ wikipedia_en    │ wikimedia/wikipedia 20231101.en (~4.4B total)        │   2B  │
+│ wikipedia_en    │ wikimedia/wikipedia 20231101.en (~4.4B total)        │   1B  │
 │                 │ Encyclopedic ground-truth factual knowledge          │       │
 ├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ finepdfs        │ HuggingFaceFW/finepdfs_100BT                        │   2B  │
+│ finepdfs        │ HuggingFaceFW/finepdfs_100BT                        │   1B  │
 │                 │ PDF-extracted academic papers, books, tech docs      │       │
 ├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ mathcode_pile   │ MathGenie/MathCode-Pile (19.2B total)               │   2B  │
+│ mathcode_pile   │ MathGenie/MathCode-Pile (19.2B total)               │   1B  │
 │                 │ Math web + textbooks + model-synth + math code       │       │
 └─────────────────┴──────────────────────────────────────────────────────┴───────┘
-                                                               TOTAL:    40B
+                                                               TOTAL:    20B
 """
 
 import json
@@ -122,28 +122,28 @@ DATASETS = [
         "path":          "HuggingFaceFW/fineweb-edu",
         "name":          "sample-100BT",
         "split":         "train",
-        "target_tokens": 15_000_000_000,
+        "target_tokens": 8_000_000_000,
         "text_field":    "text",
     },
     {
         "slug":          "dclm",
         "path":          "HuggingFaceFW/dclm_100BT",
         "split":         "train",
-        "target_tokens": 8_000_000_000,
+        "target_tokens": 4_000_000_000,
         "text_field":    "text",
     },
     {
         "slug":          "open_web_math",
         "path":          "open-web-math/open-web-math",
         "split":         "train",
-        "target_tokens": 7_000_000_000,
+        "target_tokens": 3_000_000_000,
         "text_field":    "text",
     },
     {
         "slug":          "cosmopedia",
         "path":          "HuggingFaceTB/cosmopedia",
         "split":         "train",
-        "target_tokens": 4_000_000_000,
+        "target_tokens": 2_000_000_000,
         "text_field":    "text",
     },
     {
@@ -151,14 +151,14 @@ DATASETS = [
         "path":          "wikimedia/wikipedia",
         "name":          "20231101.en",
         "split":         "train",
-        "target_tokens": 2_000_000_000,
+        "target_tokens": 1_000_000_000,
         "text_field":    "text",
     },
     {
         "slug":          "finepdfs",
         "path":          "HuggingFaceFW/finepdfs_100BT",
         "split":         "train",
-        "target_tokens": 2_000_000_000,
+        "target_tokens": 1_000_000_000,
         "text_field":    "text",
     },
     {
@@ -167,32 +167,11 @@ DATASETS = [
         "slug":          "mathcode_pile",
         "path":          "MathGenie/MathCode-Pile",
         "split":         "train",
-        "target_tokens": 2_000_000_000,
+        "target_tokens": 1_000_000_000,
         "text_field":    "text",
     },
-
-    # ── CODE ──────────────────────────────────────────────────────────────────
-    # StarCoderData uses "content" field (not "text") and data_dir for language.
-    # Python: ~35B tokens available.  JS/TS: ~24B tokens available.
-    # Code improves reasoning, instruction-following, and structured generation.
-    {
-        "slug":          "starcoder_python",
-        "path":          "bigcode/starcoderdata",
-        "data_dir":      "python",
-        "split":         "train",
-        "target_tokens": 2_000_000_000,
-        "text_field":    "content",
-    },
-    {
-        "slug":          "starcoder_js",
-        "path":          "bigcode/starcoderdata",
-        "data_dir":      "javascript",
-        "split":         "train",
-        "target_tokens": 1_000_000_000,
-        "text_field":    "content",
-    },
 ]
-# Total target: 15B + 8B + 7B + 4B + 2B + 2B + 2B + 2B + 1B = 43B tokens
+# Total target: 8B + 4B + 3B + 2B + 1B + 1B + 1B = 20B tokens
 
 
 # ──────────────────────────────────────────────────────────────────────────────
