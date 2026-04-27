@@ -1,12 +1,26 @@
+# Python bytecode and caches
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.egg-info/
-dist/
-build/
+*.py,cover
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
 *.egg
+*.egg-info/
 .eggs/
+build/
+dist/
+pip-wheel-metadata/
 *.so
 *.dylib
 
@@ -14,21 +28,35 @@ build/
 .venv/
 venv/
 env/
+ENV/
+
+# Editor and local tool state
+.claude/
+.idea/
+.vscode/
+*.code-workspace
 
 # Jupyter
 .ipynb_checkpoints/
 
-# Training artifacts
+# Training, export, and experiment artifacts
 checkpoints/
 wandb/
+logs/
+*.log
 *.ckpt
 *.pt
 *.bin
+*.safetensors
+*.onnx
 
-# Logs
-*.log
-logs/
+# Generated datasets and temp prep output
+data/train/
+data/val/
+data/hf_shards/
+data/tmp/
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
+Desktop.ini

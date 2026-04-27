@@ -45,6 +45,7 @@ class StreamingJsonlDataset(IterableDataset):
         max_length: int = 512,
         mask_token_id: Optional[int] = None,
         shuffle_buffer_size: int = 8192,
+        min_chunk_size: int = 16,
     ):
         super().__init__()
         self.paths = sorted(paths)
@@ -52,6 +53,7 @@ class StreamingJsonlDataset(IterableDataset):
         self.max_length = max_length
         self.mask_token_id = mask_token_id
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.min_chunk_size = min_chunk_size
 
     def _iter_files(self, file_paths: List[str]) -> Iterator[Dict]:
         """Yield raw JSON dicts from the given file paths."""
@@ -93,7 +95,7 @@ class StreamingJsonlDataset(IterableDataset):
             # Split within the document only — no cross-document token bleeding.
             for start in range(0, len(ids), self.max_length):
                 chunk = ids[start : start + self.max_length]
-                if len(chunk) >= 16:
+                if len(chunk) >= self.min_chunk_size:
                     yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
@@ -140,6 +142,8 @@ def collate_fn(
         - ``input_ids``: (B, max_len) padded tensor
         - ``attention_mask``: (B, max_len) bool tensor (True = real token)
     """
+    if not batch:
+        raise RuntimeError("collate_fn received an empty batch")
     max_len = max(x["input_ids"].shape[0] for x in batch)
     input_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros(len(batch), max_len, dtype=torch.bool)

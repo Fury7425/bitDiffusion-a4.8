@@ -19,7 +19,7 @@ import math
 import os
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 import torch
@@ -32,7 +32,7 @@ from .diffusion import CosineSchedule, MaskDiffusionLoss, ThinkingMaskSchedule, 
 from .model import BitDiffusionTransformer, ModelConfig
 from .quantization import KVCache
 from .utils import (
-    BitStats, ExpertStats, WandBLogger, count_parameters, load_checkpoint,
+    BitStats, ExpertStats, WandBLogger, count_parameters, force_utf8_console, load_checkpoint,
     log_expert_utilization, read_checkpoint, resolve_checkpoint_model_config,
     save_checkpoint, setup_logging, validate_model_config_topology,
 )
@@ -98,6 +98,7 @@ class TrainConfig:
     num_workers: int = 4
     seed: int = 42
     resume_from: str = ""
+    trust_checkpoint: bool = False
     wandb_project: str = "bitdiffusion-a48"
     bf16: bool = True
     device: str = "cuda"
@@ -132,8 +133,9 @@ class TrainConfig:
     gradient_checkpointing: bool = True
 
     # --- Recurrent-Depth Transformer (OpenMythos integration) ---
-    # Set model_type="rdt" to train BitRDTTransformer instead of the standard model.
-    model_type: str = "standard"  # "standard" or "rdt"
+    # RDT is the default model. Set model_type="standard" to train the flat
+    # BitDiffusionTransformer instead.
+    model_type: str = "rdt"  # "rdt" (default) or "standard"
     rdt_prelude_layers: int = 4
     rdt_recurrent_layers: int = 2
     rdt_coda_layers: int = 4
@@ -230,31 +232,35 @@ def validate(
     Returns:
         Average validation loss.
     """
+    was_training = model.training
     model.eval()
     total_loss = 0.0
     count = 0
 
-    for i, batch in enumerate(val_loader):
-        if i >= max_batches:
-            break
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)  # (B, T) bool
-        B, T = input_ids.shape
+    try:
+        for i, batch in enumerate(val_loader):
+            if i >= max_batches:
+                break
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)  # (B, T) bool
+            B, T = input_ids.shape
 
-        t = torch.rand(B, device=device)
-        # Exclude padded positions from masking and loss
-        masked_ids, is_masked = apply_mask(
-            input_ids, t, mask_token_id, schedule, frozen_mask=~attention_mask
-        )
+            t = torch.rand(B, device=device)
+            # Exclude padded positions from masking and loss
+            masked_ids, is_masked = apply_mask(
+                input_ids, t, mask_token_id, schedule, frozen_mask=~attention_mask
+            )
 
-        with autocast("cuda", dtype=torch.bfloat16):
-            logits, _ = model(masked_ids, t)
-            loss = loss_fn(logits, input_ids, is_masked)
+            with autocast("cuda", dtype=torch.bfloat16):
+                logits, _ = model(masked_ids, t)
+                loss = loss_fn(logits, input_ids, is_masked)
 
-        total_loss += loss.item()
-        count += 1
+            total_loss += loss.item()
+            count += 1
+    finally:
+        if was_training:
+            model.train()
 
-    model.train()
     return total_loss / max(count, 1)
 
 
@@ -288,45 +294,49 @@ def generate_sample(
     Returns:
         Decoded string.
     """
+    was_training = model.training
     model.eval()
-    gen = torch.Generator(device=device).manual_seed(seed)
-    schedule = CosineSchedule()
+    try:
+        gen = torch.Generator(device=device).manual_seed(seed)
+        schedule = CosineSchedule()
 
-    # Start fully masked
-    ids = torch.full((1, seq_len), mask_token_id, dtype=torch.long, device=device)
+        # Start fully masked
+        ids = torch.full((1, seq_len), mask_token_id, dtype=torch.long, device=device)
 
-    t_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)
+        t_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)
 
-    for i in range(steps):
-        t_curr = t_steps[i]
-        t_next = t_steps[i + 1]
+        for i in range(steps):
+            t_curr = t_steps[i]
+            t_next = t_steps[i + 1]
 
-        t_input = t_curr.unsqueeze(0)  # (1,)
-        logits, _ = model(ids, t_input)  # (1, T, V)
+            t_input = t_curr.unsqueeze(0)  # (1,)
+            logits, _ = model(ids, t_input)  # (1, T, V)
 
-        # Sample at masked positions — slice to normal vocab only so that
-        # special tokens (mask, think) cannot be sampled and silently clamped.
-        is_masked = (ids == mask_token_id)
-        probs = torch.softmax(logits[:, :, :model.config.vocab_size] / temperature, dim=-1)
+            # Sample at masked positions — slice to normal vocab only so that
+            # special tokens (mask, think) cannot be sampled and silently clamped.
+            is_masked = (ids == mask_token_id)
+            probs = torch.softmax(logits[:, :, :model.config.vocab_size] / temperature, dim=-1)
 
-        # Sample from distribution
-        flat_probs = probs.view(-1, probs.shape[-1])
-        sampled = torch.multinomial(flat_probs, 1, generator=gen).view(1, seq_len)
+            # Sample from distribution
+            flat_probs = probs.view(-1, probs.shape[-1])
+            sampled = torch.multinomial(flat_probs, 1, generator=gen).view(1, seq_len)
 
-        # Unmask: place sampled tokens at masked positions
-        ids = torch.where(is_masked, sampled, ids)
+            # Unmask: place sampled tokens at masked positions
+            ids = torch.where(is_masked, sampled, ids)
 
-        # Re-mask positions that should still be uncertain at t_next
-        if t_next > 0:
-            mask_prob_next = schedule.mask_prob(t_next)
-            rand = torch.rand(1, seq_len, device=device, generator=gen)
-            should_remask = rand < mask_prob_next
-            ids = torch.where(should_remask & is_masked, mask_token_id, ids)
+            # Re-mask positions that should still be uncertain at t_next
+            if t_next > 0:
+                mask_prob_next = schedule.mask_prob(t_next)
+                rand = torch.rand(1, seq_len, device=device, generator=gen)
+                should_remask = rand < mask_prob_next
+                ids = torch.where(should_remask & is_masked, mask_token_id, ids)
 
-    # Decode — replace any remaining mask tokens
-    ids = ids.clamp(0, model.config.vocab_size - 1)
-    text = tokenizer.decode(ids[0].tolist(), skip_special_tokens=True)
-    model.train()
+        # Decode — replace any remaining mask tokens
+        ids = ids.clamp(0, model.config.vocab_size - 1)
+        text = tokenizer.decode(ids[0].tolist(), skip_special_tokens=True)
+    finally:
+        if was_training:
+            model.train()
     return text
 
 
@@ -388,9 +398,8 @@ def train(cfg: TrainConfig) -> None:
 
     # Model
     if cfg.model_type == "rdt":
-        from dataclasses import asdict as _asdict
         from .rdt import BitRDTTransformer, RDTConfig
-        base = _asdict(model_cfg)
+        base = asdict(model_cfg)
         base.update(
             use_rdt=True,
             prelude_layers=cfg.rdt_prelude_layers,
@@ -475,7 +484,11 @@ def train(cfg: TrainConfig) -> None:
     global_step = 0
     current_mode = "A8"
     if cfg.resume_from and os.path.isfile(cfg.resume_from):
-        resume_ckpt = read_checkpoint(cfg.resume_from, device="cpu")
+        resume_ckpt = read_checkpoint(
+            cfg.resume_from,
+            device="cpu",
+            trust_checkpoint=cfg.trust_checkpoint,
+        )
         try:
             resume_model_cfg, _ = resolve_checkpoint_model_config(resume_ckpt)
         except ValueError:
@@ -490,7 +503,14 @@ def train(cfg: TrainConfig) -> None:
                 resume_model_cfg,
                 context=f"Resume checkpoint {cfg.resume_from}",
             )
-        info = load_checkpoint(cfg.resume_from, model, optimizer, lr_scheduler, device)
+        info = load_checkpoint(
+            cfg.resume_from,
+            model,
+            optimizer,
+            lr_scheduler,
+            device,
+            trust_checkpoint=cfg.trust_checkpoint,
+        )
         global_step = info["step"]
         current_mode = info["activation_mode"]
         logger.info("Resumed from step %d, activation mode=%s", global_step, current_mode)
@@ -678,6 +698,7 @@ def main() -> None:
     """Parse arguments and launch training."""
     import argparse
 
+    force_utf8_console()
     parser = argparse.ArgumentParser(description="Train BitDiffusion a4.8")
     # Expose all TrainConfig fields as CLI arguments
     defaults = TrainConfig()

@@ -23,7 +23,8 @@ import torch
 from transformers import AutoTokenizer
 
 from .model import BitDiffusionTransformer, ModelConfig
-from .utils import read_checkpoint, resolve_checkpoint_model_config, setup_logging
+from .rdt import BitRDTTransformer, resolve_rdt_config
+from .utils import force_utf8_console, read_checkpoint, resolve_checkpoint_model_config, setup_logging
 
 logger = logging.getLogger("bitdiffusion")
 
@@ -63,9 +64,17 @@ def _build_model_config(args: argparse.Namespace, tokenizer=None) -> ModelConfig
 def load_model_from_checkpoint(
     args: argparse.Namespace,
     tokenizer=None,
-) -> tuple[BitDiffusionTransformer, dict, ModelConfig]:
-    """Load the checkpoint and resolve the export ``ModelConfig``."""
-    ckpt = read_checkpoint(args.checkpoint, device="cpu")
+) -> tuple[torch.nn.Module, dict, ModelConfig]:
+    """Load the checkpoint and resolve the export ``ModelConfig``.
+
+    Dispatches to ``BitRDTTransformer`` when the checkpoint carries an
+    ``rdt_config`` key or when ``ModelConfig.use_rdt`` is True.
+    """
+    ckpt = read_checkpoint(
+        args.checkpoint,
+        device="cpu",
+        trust_checkpoint=getattr(args, "trust_checkpoint", False),
+    )
     if not ckpt.get("model_config") and not args.tokenizer:
         raise ValueError(
             "Checkpoint does not include serialized model_config. "
@@ -82,7 +91,18 @@ def load_model_from_checkpoint(
     else:
         logger.warning("Checkpoint has no embedded model_config; using CLI fallback arguments")
 
-    model = BitDiffusionTransformer(config)
+    if config.use_rdt or ckpt.get("rdt_config"):
+        rdt_cfg = resolve_rdt_config(ckpt)
+        model = BitRDTTransformer(rdt_cfg)
+        logger.info(
+            "Exporting BitRDTTransformer (prelude=%d, recurrent=%d, coda=%d, max_loops=%d)",
+            rdt_cfg.prelude_layers, rdt_cfg.recurrent_layers,
+            rdt_cfg.coda_layers, rdt_cfg.max_loop_iters,
+        )
+    else:
+        model = BitDiffusionTransformer(config)
+        logger.info("Exporting BitDiffusionTransformer (n_layers=%d)", config.n_layers)
+
     model.load_state_dict(ckpt["model_state_dict"])
     return model, ckpt, config
 
@@ -124,7 +144,7 @@ def export_checkpoint(args: argparse.Namespace) -> None:
         "export_format": args.format,
         "step": ckpt.get("step", 0),
         "activation_mode": ckpt.get("activation_mode", "A8"),
-        "architecture": "BitDiffusionTransformer",
+        "architecture": type(model).__name__,
         "runtime_note": (
             "This export preserves weights and config for BitDiffusion-compatible "
             "PyTorch runtimes. It is not directly runnable in generic GGUF "
@@ -145,8 +165,14 @@ def export_checkpoint(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    force_utf8_console()
     parser = argparse.ArgumentParser(description="Export BitDiffusion checkpoints")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to training checkpoint")
+    parser.add_argument(
+        "--trust_checkpoint",
+        action="store_true",
+        help="Allow unsafe full-pickle checkpoint loading for trusted legacy checkpoints only.",
+    )
     parser.add_argument("--output_dir", type=str, required=True, help="Directory for exported files")
     parser.add_argument(
         "--format",

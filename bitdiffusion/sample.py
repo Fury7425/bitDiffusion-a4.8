@@ -16,6 +16,7 @@ import argparse
 import logging
 import os
 import time
+from dataclasses import asdict
 from typing import Optional
 
 import torch
@@ -25,7 +26,7 @@ from transformers import AutoTokenizer
 from .diffusion import CosineSchedule, ThinkingMaskSchedule
 from .model import BitDiffusionTransformer, ModelConfig
 from .quantization import KVCache
-from .utils import read_checkpoint, resolve_checkpoint_model_config, setup_logging
+from .utils import force_utf8_console, read_checkpoint, resolve_checkpoint_model_config, setup_logging
 
 
 def _model_fwd(model, ids, t, *, kv_cache=None, rope_offset=0, n_loops=None):
@@ -37,6 +38,11 @@ def _model_fwd(model, ids, t, *, kv_cache=None, rope_offset=0, n_loops=None):
 logger = logging.getLogger("bitdiffusion")
 
 _MOE_LAYER_CHOICES = ("all", "alternate", "alternate_even", "top_half")
+
+
+def _utf8_preview(text: str, limit: int = 200) -> str:
+    """Truncate to a byte budget without splitting a UTF-8 sequence."""
+    return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
 
 
 def _build_model_config(args: argparse.Namespace, tokenizer) -> ModelConfig:
@@ -74,7 +80,11 @@ def load_model_from_checkpoint(
     checkpoints: when the checkpoint carries ``rdt_config`` (or when
     ``config.use_rdt`` is True), the RDT variant is instantiated automatically.
     """
-    ckpt = read_checkpoint(args.checkpoint, device="cpu")
+    ckpt = read_checkpoint(
+        args.checkpoint,
+        device="cpu",
+        trust_checkpoint=getattr(args, "trust_checkpoint", False),
+    )
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
@@ -89,9 +99,27 @@ def load_model_from_checkpoint(
     else:
         logger.warning("Checkpoint has no embedded model_config; using CLI fallback arguments")
 
-    if config.use_rdt or ckpt.get("rdt_config"):
+    is_rdt = bool(config.use_rdt or ckpt.get("rdt_config"))
+    if not is_rdt:
+        # Topology safeguard for legacy checkpoints whose model_config does
+        # not carry use_rdt/rdt_config: if the state-dict has RDT-specific
+        # parameter names, route to BitRDTTransformer regardless.
+        state_keys = ckpt.get("model_state_dict", {}).keys()
+        if any(k.startswith(("prelude.", "recurrent.", "coda.")) for k in state_keys):
+            logger.warning(
+                "Checkpoint state_dict has RDT topology (prelude/recurrent/coda) "
+                "but no use_rdt flag; loading as BitRDTTransformer."
+            )
+            is_rdt = True
+
+    if is_rdt:
         from .rdt import BitRDTTransformer, resolve_rdt_config
-        rdt_cfg = resolve_rdt_config(ckpt)
+        rdt_cfg = resolve_rdt_config(ckpt, fallback=None) if ckpt.get("rdt_config") else None
+        if rdt_cfg is None:
+            from .rdt import RDTConfig
+            base = asdict(config)
+            base["use_rdt"] = True
+            rdt_cfg = RDTConfig(**base)
         model = BitRDTTransformer(rdt_cfg).to(device)
         logger.info("Loaded BitRDTTransformer (prelude=%d, recurrent=%d, coda=%d, max_loops=%d)",
                     rdt_cfg.prelude_layers, rdt_cfg.recurrent_layers,
@@ -129,8 +157,10 @@ def nucleus_sample(
         # Remove tokens with cumulative probability above the threshold
         remove_mask = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
         sorted_logits[remove_mask] = -float("inf")
-        # Scatter back
-        logits = sorted_logits.scatter(-1, sorted_idx, sorted_logits)
+        # Scatter back into original token order
+        filtered = torch.full_like(logits, float("-inf"))
+        filtered.scatter_(-1, sorted_idx, sorted_logits)
+        logits = filtered
 
     probs = F.softmax(logits, dim=-1)
     return torch.multinomial(probs, 1, generator=generator).squeeze(-1)
@@ -230,7 +260,9 @@ def denoise(
                 cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
                 remove_mask = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
                 sorted_logits[remove_mask] = -float("inf")
-                masked_logits = torch.zeros_like(masked_logits).scatter(-1, sorted_idx, sorted_logits)
+                filtered = torch.full_like(masked_logits, float("-inf"))
+                filtered.scatter_(-1, sorted_idx, sorted_logits)
+                masked_logits = filtered
             probs = F.softmax(masked_logits, dim=-1)
             flat_probs = probs.view(-1, probs.shape[-1])
             sampled = torch.multinomial(flat_probs, 1, generator=gen).view(num_samples, total_len)
@@ -251,7 +283,7 @@ def denoise(
                 n_masked = (ids[b] == mask_token_id).sum().item()
                 logger.info(
                     "Step %d/%d (t=%.3f→%.3f, masked=%d): %s",
-                    step_idx + 1, steps, t_curr.item(), t_next.item(), n_masked, text[:200],
+                    step_idx + 1, steps, t_curr.item(), t_next.item(), n_masked, _utf8_preview(text),
                 )
 
     # Final decode
@@ -458,7 +490,7 @@ class ThinkingDiffusionSampler:
                     logger.info(
                         "Think step %d/%d (t=%.3f→%.3f, masked=%d): %s",
                         step_idx + 1, total_think_steps, t_curr.item(), t_next.item(),
-                        n_masked, text[:200],
+                        n_masked, _utf8_preview(text),
                     )
 
             # Adaptive early stopping: measure token change rate after re-masking
@@ -534,7 +566,7 @@ class ThinkingDiffusionSampler:
                     logger.info(
                         "Answer step %d/%d (t=%.3f→%.3f, masked=%d): %s",
                         step_idx + 1, self.answer_steps, t_curr.item(), t_next.item(),
-                        n_masked, text[:200],
+                        n_masked, _utf8_preview(text),
                     )
 
         # Final decode
@@ -633,7 +665,9 @@ class BlockDiffusionSampler:
             cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
             remove = cumprobs - sorted_logits.softmax(dim=-1) >= self.top_p
             sorted_logits[remove] = -float("inf")
-            masked_logits = torch.zeros_like(masked_logits).scatter(-1, sorted_idx, sorted_logits)
+            filtered = torch.full_like(masked_logits, float("-inf"))
+            filtered.scatter_(-1, sorted_idx, sorted_logits)
+            masked_logits = filtered
         probs = F.softmax(masked_logits, dim=-1)
         B, T, V = probs.shape
         sampled = torch.multinomial(probs.view(-1, V), 1, generator=gen).view(B, T)
@@ -896,8 +930,14 @@ class BlockDiffusionSampler:
 
 def main() -> None:
     """CLI entry point for sampling."""
+    force_utf8_console()
     parser = argparse.ArgumentParser(description="BitDiffusion a4.8 — Denoising Sampler")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument(
+        "--trust_checkpoint",
+        action="store_true",
+        help="Allow unsafe full-pickle checkpoint loading for trusted legacy checkpoints only.",
+    )
     parser.add_argument("--tokenizer", type=str, default="Qwen/Qwen-tokenizer", help="Tokenizer path or name")
     parser.add_argument("--prompt", type=str, default="", help="Conditioning prompt prefix")
     parser.add_argument("--length", type=int, default=128, help="Total sequence length")

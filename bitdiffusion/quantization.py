@@ -14,6 +14,7 @@ Implements:
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -21,6 +22,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger("bitdiffusion")
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +599,13 @@ class HybridKVCache:
         levels = 1 << bits
         try:
             from scipy.stats import norm
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                "scipy unavailable (%s) — Lloyd-Max codebook for %d bits "
+                "falls back to uniform linspace; KV-cache turboquant fidelity "
+                "will be reduced. Install scipy to silence this warning.",
+                e, bits,
+            )
             norm = None
 
         if norm is None:
@@ -652,7 +661,7 @@ class HybridKVCache:
         raise ValueError(f"Unsupported unpack bits: {bits}")
 
     def _absmax_compress(self, tensor: torch.Tensor) -> _CompressedChunk:
-        scale = tensor.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 3.0
+        scale = (tensor.float().abs().amax(dim=-1, keepdim=True) / 3.0).clamp(min=1e-6)
         values = (tensor.float() / scale).round().clamp(-3, 3) + 3.0
         packed, orig_last_dim = self._pack_indices(values, bits=3)
         return _CompressedChunk(
@@ -799,22 +808,56 @@ class HybridKVCache:
         return k_full, v_full
 
     def update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compatibility wrapper for the existing attention code path."""
+        """Append a multi-token chunk in one shot, preserving BOS / recent /
+        bulk semantics. Avoids the O(seq) per-token cat from the old loop.
+        """
         if k.shape != v.shape:
             raise ValueError(f"K/V shape mismatch: {k.shape} vs {v.shape}")
         if k.ndim != 4:
             raise ValueError(f"update expects rank-4 tensors, got {tuple(k.shape)}")
 
-        for token_idx in range(k.shape[2]):
-            self.append(
+        T_new = k.shape[2]
+        if T_new == 0:
+            return self.get(
                 layer_idx,
-                k[:, :, token_idx:token_idx + 1, :],
-                v[:, :, token_idx:token_idx + 1, :],
+                target_shape=(k.shape[0], k.shape[1], self._layers[layer_idx].total_tokens, k.shape[-1]),
             )
+
+        self._ensure_runtime_shape(n_heads=k.shape[1], head_dim=k.shape[-1])
+        state = self._layers[layer_idx]
+        k16 = k.detach().to(torch.float16)
+        v16 = v.detach().to(torch.float16)
+
+        # Fold off the BOS token if this is the first call.
+        if state.total_tokens == 0:
+            state.bos_k = k16[:, :, :1, :]
+            state.bos_v = v16[:, :, :1, :]
+            state.total_tokens = 1
+            k16 = k16[:, :, 1:, :]
+            v16 = v16[:, :, 1:, :]
+
+        if k16.shape[2] > 0:
+            if state.recent_k is None:
+                state.recent_k = k16
+                state.recent_v = v16
+            else:
+                state.recent_k = torch.cat([state.recent_k, k16], dim=2)
+                state.recent_v = torch.cat([state.recent_v, v16], dim=2)
+            state.total_tokens += k16.shape[2]
+
+            # Evict overflow as one chunk rather than per token.
+            if state.recent_k.shape[2] > self.recent_window:
+                overflow = state.recent_k.shape[2] - self.recent_window
+                old_k = state.recent_k[:, :, :overflow, :].to(torch.float32)
+                old_v = state.recent_v[:, :, :overflow, :].to(torch.float32)
+                state.bulk_k.append(self._compress_chunk(layer_idx, old_k))
+                state.bulk_v.append(self._compress_chunk(layer_idx, old_v))
+                state.recent_k = state.recent_k[:, :, overflow:, :].contiguous()
+                state.recent_v = state.recent_v[:, :, overflow:, :].contiguous()
 
         return self.get(
             layer_idx,
-            target_shape=(k.shape[0], k.shape[1], self._layers[layer_idx].total_tokens, k.shape[-1]),
+            target_shape=(k.shape[0], k.shape[1], state.total_tokens, k.shape[-1]),
         )
 
     def effective_bits(self) -> float:

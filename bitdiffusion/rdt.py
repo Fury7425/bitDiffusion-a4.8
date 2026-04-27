@@ -167,7 +167,10 @@ class BitLoRAAdapter(nn.Module):
         Returns:
             (B, T, hidden_dim) delta to add to the hidden state.
         """
-        gate = self.iter_gate[loop_iter]
+        # Clamp loop_iter to the last trained gate so depth extrapolation
+        # (n_loops > max_loop_iters at inference) does not index out of bounds.
+        idx = min(loop_iter, self.iter_gate.shape[0] - 1)
+        gate = self.iter_gate[idx]
         return gate * self.up(self.down(x))
 
 
@@ -379,8 +382,10 @@ class BitRecurrentBlock(nn.Module):
             # Per-iteration LoRA delta
             block_out = block_out + self.lora(block_out, i)
 
-            # Per-loop output scaling (lets loops specialise)
-            block_out = self.alpha[i] * block_out
+            # Per-loop output scaling (lets loops specialise). Clamp index for
+            # depth extrapolation (n_loops > max_loop_iters at inference).
+            alpha_idx = min(i, self.alpha.shape[0] - 1)
+            block_out = self.alpha[alpha_idx] * block_out
 
             # LTI hidden state update
             h = self.injection(h, e, block_out)
@@ -473,6 +478,22 @@ class BitRDTTransformer(nn.Module):
 
         self._save_original_modes()
         self.apply(self._init_weights)
+        # Total residual depth: prelude + recurrent (counted once — shared
+        # block) + coda. Use this as the scaling denominator.
+        n_residual = config.prelude_layers + config.recurrent_layers + config.coda_layers
+        self._scale_residual_init(n_residual)
+
+    def _scale_residual_init(self, n_residual_blocks: int) -> None:
+        """GPT-2-style scaled init for residual output projections."""
+        scale = 1.0 / math.sqrt(max(2 * n_residual_blocks, 1))
+        for name, module in self.named_modules():
+            if isinstance(module, BitLinear) and (
+                name.endswith(".attn.o_proj")
+                or name.endswith(".ffn.down_proj")
+                or name.endswith(".down_proj")
+            ):
+                with torch.no_grad():
+                    module.latent_weight.mul_(scale)
 
     def _init_weights(self, module: nn.Module) -> None:
         from .model import Int8Linear

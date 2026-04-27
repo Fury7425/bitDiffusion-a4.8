@@ -734,6 +734,25 @@ class BitDiffusionTransformer(nn.Module):
         self._save_original_modes()
 
         self.apply(self._init_weights)
+        self._scale_residual_init(config.n_layers)
+
+    def _scale_residual_init(self, n_residual_blocks: int) -> None:
+        """Apply GPT-2-style scaled init to residual output projections.
+
+        For BitLinear layers ending each residual stream (attn.o_proj and
+        ffn.down_proj), divide the latent_weight std by ``sqrt(2 * n_blocks)``.
+        Stabilises gradient magnitudes at depth and helps the recurrent
+        loops in RDT converge.
+        """
+        scale = 1.0 / math.sqrt(max(2 * n_residual_blocks, 1))
+        for name, module in self.named_modules():
+            if isinstance(module, BitLinear) and (
+                name.endswith(".attn.o_proj")
+                or name.endswith(".ffn.down_proj")
+                or name.endswith(".down_proj")
+            ):
+                with torch.no_grad():
+                    module.latent_weight.mul_(scale)
 
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights with scaled normal distribution.

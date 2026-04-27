@@ -38,6 +38,11 @@ class DummyTokenizer:
         Path(output_dir, "tokenizer.json").write_text("{}", encoding="utf-8")
 
 
+class UnsafeCheckpointPayload:
+    def __init__(self, value: str = "ok") -> None:
+        self.value = value
+
+
 def make_config(**overrides) -> ModelConfig:
     config = dict(
         vocab_size=32,
@@ -51,6 +56,7 @@ def make_config(**overrides) -> ModelConfig:
         t_embed_dim=8,
         kv_cache_bits=3,
         kv_cache_bos_bits=4,
+        N_think=0,
         use_moe=False,
         n_experts=4,
         top_k_experts=2,
@@ -152,6 +158,19 @@ class CompatibilityTests(unittest.TestCase):
 
         self.assertEqual(missing, [])
         self.assertEqual(unexpected, [])
+
+    def test_read_checkpoint_rejects_untrusted_pickle_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir, "unsafe.pt")
+            torch.save({"payload": UnsafeCheckpointPayload()}, checkpoint_path)
+
+            with self.assertRaisesRegex(Exception, "Weights only load failed|Unsupported global"):
+                read_checkpoint(str(checkpoint_path))
+
+            trusted = read_checkpoint(str(checkpoint_path), trust_checkpoint=True)
+
+        self.assertIsInstance(trusted["payload"], UnsafeCheckpointPayload)
+        self.assertEqual(trusted["payload"].value, "ok")
 
     def test_sample_loader_prefers_checkpoint_model_config(self) -> None:
         config = make_config(hidden_dim=16, use_moe=True, moe_layers="alternate")
@@ -295,7 +314,7 @@ class CompatibilityTests(unittest.TestCase):
             def eval(self):
                 return self
 
-            def __call__(self, ids, t, kv_cache=None):
+            def __call__(self, ids, t, kv_cache=None, rope_offset=0):
                 batch, seq_len = ids.shape
                 logits = torch.zeros(batch, seq_len, self.config.vocab_size + 1)
                 logits[..., 0] = 1.0
@@ -320,6 +339,19 @@ class CompatibilityTests(unittest.TestCase):
             len(cache_instances), 0,
             "denoise() must not allocate a KV cache — each step reprocesses "
             "the full sequence from scratch.",
+        )
+
+
+class DefaultModelTests(unittest.TestCase):
+    def test_default_train_config_is_rdt(self) -> None:
+        """The repo default model_type should be 'rdt' so plain `train.py`
+        invocations train BitRDTTransformer."""
+        from bitdiffusion.train import TrainConfig
+
+        cfg = TrainConfig()
+        self.assertEqual(
+            cfg.model_type, "rdt",
+            "Default model_type should be 'rdt' (BitRDTTransformer is the default model).",
         )
 
 

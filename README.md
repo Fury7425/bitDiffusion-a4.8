@@ -121,10 +121,10 @@ python sample.py \
 | Thinking tokens | 64 |
 | KV cache bits | 3 (BOS: 4) |
 
-### RDT Variant (BitRDTTransformer)
+### Default model: BitRDTTransformer (Recurrent-Depth Transformer)
 
-`bitdiffusion/rdt.py` provides a Recurrent-Depth Transformer variant built on the
-OpenMythos architecture. It replaces the stacked-layers design with a
+`bitdiffusion/rdt.py` is the **default model** in this repo. Built on the
+OpenMythos architecture, it replaces the stacked-layers design with a
 Prelude → RecurrentBlock → Coda structure: shared weights are applied for
 multiple loop iterations, giving the model depth-adaptivity without extra parameters.
 
@@ -134,8 +134,11 @@ Key adaptations for diffusion:
 - Soft ACT weighting (no hard per-token halting) for uniform refinement
 - LTI A matrix: `0.99 * tanh(A_raw)` guarantees spectral radius < 1
 - Loop dropout during training so every loop prefix is independently useful
+- Inference-time depth extrapolation via `--n_loops` in `sample.py`
 
-To use the RDT variant, import `BitRDTTransformer` and `RDTConfig` from `bitdiffusion.rdt`.
+`train.py` uses `model_type="rdt"` by default. Pass `--model_type standard` to
+opt out and train the flat `BitDiffusionTransformer` instead. Both checkpoint
+formats are auto-detected by `sample.py` and `export.py`.
 
 ---
 

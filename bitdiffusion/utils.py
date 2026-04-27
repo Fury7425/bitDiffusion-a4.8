@@ -72,8 +72,10 @@ class WandBLogger:
             logger.info("WandB logging enabled — project=%s", project)
         except ImportError:
             logger.info("wandb not installed — logging disabled")
-        except Exception as e:
+        except wandb.Error as e:
             logger.warning("wandb init failed: %s — logging disabled", e)
+        except Exception as e:
+            logger.debug("wandb init hit unexpected error: %s", e)
 
     def log(self, data: Dict[str, Any], step: Optional[int] = None) -> None:
         """Log a dict of metrics."""
@@ -82,8 +84,8 @@ class WandBLogger:
         try:
             import wandb
             wandb.log(data, step=step)
-        except Exception:
-            pass
+        except wandb.Error as e:
+            logger.debug("wandb.log failed: %s", e)
 
     def finish(self) -> None:
         """Finalize the wandb run."""
@@ -91,8 +93,8 @@ class WandBLogger:
             try:
                 import wandb
                 wandb.finish()
-            except Exception:
-                pass
+            except wandb.Error as e:
+                logger.debug("wandb.finish failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +188,27 @@ class BitStats:
 # Checkpoint save / load
 # ---------------------------------------------------------------------------
 
-def read_checkpoint(path: str, device: str = "cpu") -> Dict[str, Any]:
-    """Load a raw checkpoint dict from disk."""
-    return torch.load(path, map_location=device, weights_only=False)
+def read_checkpoint(
+    path: str,
+    device: str = "cpu",
+    trust_checkpoint: bool = False,
+) -> Dict[str, Any]:
+    """Load a raw checkpoint dict from disk.
+
+    Uses ``weights_only=True`` by default — this rejects arbitrary pickle
+    payloads and only loads tensors plus a small allowlist of plain Python
+    containers. Pass ``trust_checkpoint=True`` only for checkpoints whose
+    origin you trust (e.g. ones you produced yourself); this re-enables the
+    legacy unsafe pickle path.
+    """
+    if trust_checkpoint:
+        logger.warning(
+            "Loading %s with trust_checkpoint=True (full pickle). "
+            "Only do this for checkpoints you produced or fully trust.",
+            path,
+        )
+        return torch.load(path, map_location=device, weights_only=False)
+    return torch.load(path, map_location=device, weights_only=True)
 
 
 def resolve_checkpoint_model_config(
@@ -288,6 +308,7 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
     device: str = "cpu",
+    trust_checkpoint: bool = False,
 ) -> Dict[str, Any]:
     """Load a training checkpoint.
 
@@ -301,7 +322,7 @@ def load_checkpoint(
     Returns:
         Dict with ``step``, ``activation_mode``, and any ``extra`` metadata.
     """
-    ckpt = read_checkpoint(path, device=device)
+    ckpt = read_checkpoint(path, device=device, trust_checkpoint=trust_checkpoint)
     model.load_state_dict(ckpt["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -321,12 +342,29 @@ def load_checkpoint(
 # Logging setup
 # ---------------------------------------------------------------------------
 
+def force_utf8_console() -> None:
+    """Reconfigure stdout/stderr to UTF-8 so non-ASCII characters in CLI
+    output (em-dashes, accented chars, etc.) don't crash on Windows
+    consoles that default to legacy code pages like cp949 or cp1252.
+
+    Safe to call multiple times; no-op on streams that don't support
+    reconfigure.
+    """
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
 def setup_logging(level: int = logging.INFO) -> None:
     """Configure the ``bitdiffusion`` logger with a stream handler.
 
     Args:
         level: Logging level. Default INFO.
     """
+    force_utf8_console()
     fmt = logging.Formatter("[%(asctime)s] %(name)s %(levelname)s: %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
     handler = logging.StreamHandler()

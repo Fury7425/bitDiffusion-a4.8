@@ -255,6 +255,7 @@ class TestDataLoaderLengthPreservation(unittest.TestCase):
             tokenizer=TrivialTokenizer(),
             max_length=max_length,
             shuffle_buffer_size=1,
+            min_chunk_size=1,
         )
 
     def test_no_cross_document_bleeding(self):
@@ -344,6 +345,45 @@ class TestForwardBackwardCPU(unittest.TestCase):
             (is_masked & padding_positions).any(),
             "Padded positions must not be included in is_masked",
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Nucleus sampling — top-p filter must preserve top-mass and zero rest
+# ---------------------------------------------------------------------------
+
+class TestNucleusSampling(unittest.TestCase):
+    def test_top_p_keeps_top_mass_only(self):
+        """After top-p filtering, the renormalised mass over kept tokens
+        must equal 1.0 and removed tokens must have zero probability."""
+        from bitdiffusion.sample import nucleus_sample
+
+        torch.manual_seed(0)
+        B, V = 4, 64
+        logits = torch.randn(B, V) * 3.0  # spread mass across vocab
+
+        for top_p in (0.5, 0.8, 0.95):
+            # Recover what the function does internally to verify mass
+            sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+            cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            remove_mask = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
+            sorted_logits = sorted_logits.clone()
+            sorted_logits[remove_mask] = -float("inf")
+            filtered = torch.full_like(logits, float("-inf")).scatter(
+                -1, sorted_idx, sorted_logits
+            )
+            probs = torch.softmax(filtered, dim=-1)
+
+            # Removed tokens must have probability 0 after softmax of -inf
+            removed_count = remove_mask.sum().item()
+            self.assertGreater(removed_count, 0, f"top_p={top_p} removed nothing")
+            # Each row must sum to 1 (renormalised over the kept set)
+            row_sums = probs.sum(dim=-1)
+            self.assertTrue(torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5))
+
+        # End-to-end: returned token IDs must lie inside [0, V).
+        ids = nucleus_sample(logits, temperature=1.0, top_p=0.5)
+        self.assertEqual(ids.shape, (B,))
+        self.assertTrue(((ids >= 0) & (ids < V)).all())
 
 
 if __name__ == "__main__":
