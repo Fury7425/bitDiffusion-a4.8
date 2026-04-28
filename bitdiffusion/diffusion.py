@@ -212,7 +212,7 @@ class MaskDiffusionLoss(nn.Module):
         # were excluded by think tokens or an edge-case batch), cross_entropy
         # would return NaN.  Return zero loss instead.
         if not mask_flat.any():
-            return logits.new_zeros(())
+            return (logits * 0).sum()  # keep grad_fn attached
 
         loss = F.cross_entropy(logits_flat, targets_loss, ignore_index=self.ignore_index)
         return loss
