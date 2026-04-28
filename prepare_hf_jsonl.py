@@ -142,6 +142,7 @@ DATASETS = [
     {
         "slug":          "cosmopedia",
         "path":          "HuggingFaceTB/cosmopedia",
+        "name":          "web_samples_v1",
         "split":         "train",
         "target_tokens": 2_000_000_000,
         "text_field":    "text",
