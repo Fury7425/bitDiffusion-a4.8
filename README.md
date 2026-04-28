@@ -196,8 +196,8 @@ python train.py \
     --max_steps 60000 \
     --batch_size 8 \
     --max_seq_len 4096 \
-    --lr 5e-4 \
-    --warmup_steps 4000 \
+    --lr 2.5e-4 \
+    --warmup_steps 2000 \
     --grad_accum_steps 16 \
     --a4_warmup_fraction 0.10 \
     --gradient_checkpointing \
@@ -212,9 +212,9 @@ python train.py \
 | Batch size | 8 | Per-device |
 | Gradient accumulation | 16 | Effective batch: 524,288 tok/step |
 | Sequence length | 4,096 | |
-| Peak LR | 5e-4 | |
+| Peak LR | 2.5e-4 | |
 | LR schedule | Cosine + linear warmup | Min LR ratio: 0.1 |
-| Warmup steps | 4,000 | |
+| Warmup steps | 2,000 | |
 | Weight decay | 0.05 | AdamW |
 | Gradient clip | 1.0 | |
 | Mixed precision | bf16 | |

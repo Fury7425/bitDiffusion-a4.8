@@ -85,9 +85,9 @@ class TrainConfig:
     max_steps: int = 60000
     batch_size: int = 8
     max_seq_len: int = 4096
-    lr: float = 5e-4
+    lr: float = 2.5e-4
     weight_decay: float = 0.05
-    warmup_steps: int = 4000
+    warmup_steps: int = 2000
     grad_accum_steps: int = 16
     grad_clip_norm: float = 1.0
     min_lr_ratio: float = 0.1       # cosine floor: decays to 10% of peak LR, not 0
