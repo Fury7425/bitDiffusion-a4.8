@@ -92,7 +92,7 @@ class TrainConfig:
     grad_clip_norm: float = 1.0
     min_lr_ratio: float = 0.1       # cosine floor: decays to 10% of peak LR, not 0
     a4_warmup_fraction: float = 0.10
-    save_every: int = 2500
+    save_every: int = 500
     val_every: int = 500
     bitstats_every: int = 250
     num_workers: int = 4
