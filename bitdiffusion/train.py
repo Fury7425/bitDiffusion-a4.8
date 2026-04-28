@@ -77,15 +77,15 @@ class TrainConfig:
     train_data: str = "data/train/*.jsonl"
     val_data: str = "data/val/*.jsonl"
     output_dir: str = "checkpoints"
-    # 57 500 steps × (8 batch × 16 accum × 4096 seq) ≈ 30.1B tokens.
+    # 60 000 steps × (8 batch × 16 accum × 4096 seq) ≈ 31.5B tokens.
     # For a 40B-token run set max_steps=76_294 (40e9 / 524_288).
     # batch_size=8 keeps 524K tok/step on a 40 GB A100 (~29.5 GB total).
     # 4096 context covers all standard benchmarks and beats every published
     # masked diffusion LM. Scale to 8192+ with a multi-GPU cluster.
-    max_steps: int = 57500
+    max_steps: int = 60000
     batch_size: int = 8
     max_seq_len: int = 4096
-    lr: float = 2e-4
+    lr: float = 5e-4
     weight_decay: float = 0.05
     warmup_steps: int = 4000
     grad_accum_steps: int = 16

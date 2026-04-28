@@ -48,7 +48,7 @@ Dependencies (`requirements.txt`):
 
 ```bash
 python sample.py \
-    --checkpoint checkpoints/step_57500.pt \
+    --checkpoint checkpoints/step_60000.pt \
     --prompt "The theory of relativity states that" \
     --length 200 \
     --steps 20
@@ -58,7 +58,7 @@ python sample.py \
 
 ```bash
 python sample.py \
-    --checkpoint checkpoints/step_57500.pt \
+    --checkpoint checkpoints/step_60000.pt \
     --thinking \
     --adaptive_think \
     --prompt "Explain how neural networks learn" \
@@ -183,7 +183,7 @@ wandb login   # optional
 python train.py
 ```
 
-Runs 57,500 steps × (8 batch × 16 grad accum × 4,096 seq) = **30.1B tokens**.
+Runs 60,000 steps × (8 batch × 16 grad accum × 4,096 seq) = **31.5B tokens**.
 
 **Resume after preemption:**
 ```bash
@@ -193,10 +193,10 @@ python train.py --resume_from checkpoints/step_XXXXX.pt
 **Custom config:**
 ```bash
 python train.py \
-    --max_steps 57500 \
+    --max_steps 60000 \
     --batch_size 8 \
     --max_seq_len 4096 \
-    --lr 2e-4 \
+    --lr 5e-4 \
     --warmup_steps 4000 \
     --grad_accum_steps 16 \
     --a4_warmup_fraction 0.10 \
@@ -208,11 +208,11 @@ python train.py \
 
 | Parameter | Value | Notes |
 |---|---|---|
-| Steps | 57,500 | 30.1B total tokens |
+| Steps | 60,000 | 31.5B total tokens |
 | Batch size | 8 | Per-device |
 | Gradient accumulation | 16 | Effective batch: 524,288 tok/step |
 | Sequence length | 4,096 | |
-| Peak LR | 2e-4 | |
+| Peak LR | 5e-4 | |
 | LR schedule | Cosine + linear warmup | Min LR ratio: 0.1 |
 | Warmup steps | 4,000 | |
 | Weight decay | 0.05 | AdamW |
@@ -224,8 +224,8 @@ python train.py \
 ### Two-Stage Activation Schedule
 
 ```
-Steps 0 → 51,750  (90%)   W1.58A8: all activations INT8
-Steps 51,750 → 57,500 (10%)  W1.58A4: hybrid INT4 + TopK(55%) + INT8
+Steps 0 → 54,000  (90%)   W1.58A8: all activations INT8
+Steps 54,000 → 60,000 (10%)  W1.58A4: hybrid INT4 + TopK(55%) + INT8
 ```
 
 Stage 1 lets ternary weights converge under a less aggressive quantization regime.
@@ -241,7 +241,7 @@ Adjust with `--a4_warmup_fraction`.
 **Basic generation:**
 ```bash
 python sample.py \
-    --checkpoint checkpoints/step_57500.pt \
+    --checkpoint checkpoints/step_60000.pt \
     --prompt "The theory of relativity states that" \
     --length 200 \
     --steps 20
@@ -250,7 +250,7 @@ python sample.py \
 **Adaptive thinking** — scratchpad runs until token change rate < 2% for 3 steps (max 128):
 ```bash
 python sample.py \
-    --checkpoint checkpoints/step_57500.pt \
+    --checkpoint checkpoints/step_60000.pt \
     --thinking --adaptive_think \
     --prompt "Explain how neural networks learn" \
     --length 300 --answer_steps 20 --verbose
@@ -259,7 +259,7 @@ python sample.py \
 **Auto-length** (recommended) — stops at EOS:
 ```bash
 python sample.py \
-    --checkpoint checkpoints/step_57500.pt \
+    --checkpoint checkpoints/step_60000.pt \
     --block --auto_length \
     --prompt "What is the mitochondria?" \
     --max_length 2048
@@ -268,7 +268,7 @@ python sample.py \
 **Block diffusion** — for outputs longer than the training context:
 ```bash
 python sample.py \
-    --checkpoint checkpoints/step_57500.pt \
+    --checkpoint checkpoints/step_60000.pt \
     --block --block_size 256 --steps 20 \
     --prompt "Write a detailed explanation of" \
     --length 2048
@@ -300,7 +300,7 @@ Resume from a pretrained checkpoint with a lower learning rate:
 
 ```bash
 python train.py \
-    --resume_from checkpoints/step_57500.pt \
+    --resume_from checkpoints/step_60000.pt \
     --train_data "data/finetune/train/*.jsonl" \
     --val_data "data/finetune/val/*.jsonl" \
     --lr 2e-5 \
@@ -327,7 +327,7 @@ Export to a portable `safetensors` package:
 
 ```bash
 python export.py \
-    --checkpoint checkpoints/step_57500.pt \
+    --checkpoint checkpoints/step_60000.pt \
     --output_dir exports/bitdiffusion-1b \
     --format safetensors \
     --tokenizer Qwen/Qwen-tokenizer
