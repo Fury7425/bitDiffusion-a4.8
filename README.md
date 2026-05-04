@@ -212,10 +212,12 @@ python train.py \
 | Batch size | 8 | Per-device |
 | Gradient accumulation | 16 | Effective batch: 524,288 tok/step |
 | Sequence length | 4,096 | |
-| Peak LR | 2e-4 | |
+| Peak LR (AdamW) | 2e-4 | Embeddings, norms, biases, unembedding head |
+| Peak LR (Muon) | 0.02 | 2D weight matrices in the transformer body |
 | LR schedule | Cosine + linear warmup | Min LR ratio: 0.1 |
 | Warmup steps | 4,000 | |
 | Weight decay | 0.05 | AdamW |
+| Optimizer | Muon + AdamW hybrid | DeepSeek V4 style; toggle via `use_muon=False` |
 | Gradient clip | 1.0 | |
 | Mixed precision | bf16 | |
 | Gradient checkpointing | Yes | ~29.5 GB on A100 40GB |

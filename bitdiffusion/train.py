@@ -30,6 +30,7 @@ from transformers import AutoTokenizer
 from .data import make_dataloader
 from .diffusion import CosineSchedule, MaskDiffusionLoss, ThinkingMaskSchedule, apply_mask
 from .model import BitDiffusionTransformer, ModelConfig
+from .muon import Muon, split_params_for_muon
 from .quantization import KVCache
 from .utils import (
     BitStats, ExpertStats, WandBLogger, count_parameters, force_utf8_console, load_checkpoint,
@@ -132,6 +133,18 @@ class TrainConfig:
     # Training efficiency
     gradient_checkpointing: bool = True
 
+    # --- Muon optimizer (DeepSeek V4 style hybrid) ---
+    # Muon orthogonalizes the SGD-momentum update of every 2D weight matrix
+    # before applying it. We use Muon for the transformer body's BitLinear /
+    # Int8Linear weights and AdamW for embeddings, RMSNorm gains, biases, and
+    # the unembedding head. Set use_muon=False to fall back to AdamW for all.
+    use_muon: bool = True
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5
+    muon_weight_decay: float = 0.0
+
     # --- Recurrent-Depth Transformer (OpenMythos integration) ---
     # RDT is the default model. Set model_type="standard" to train the flat
     # BitDiffusionTransformer instead.
@@ -202,6 +215,174 @@ def _cosine_with_warmup(
     progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+# ---------------------------------------------------------------------------
+# Hybrid optimizer / scheduler wrappers (Muon for matrices + AdamW for the rest)
+# ---------------------------------------------------------------------------
+
+class _HybridOptimizer:
+    """Holds one or more torch optimizers and exposes a single state_dict API.
+
+    Used to combine Muon (2D weight matrices) and AdamW (embeddings, norms,
+    biases, head). Duck-types the small subset of the ``Optimizer`` API that
+    the training loop and ``save_checkpoint`` rely on.
+    """
+
+    def __init__(self, *optimizers: torch.optim.Optimizer):
+        if not optimizers:
+            raise ValueError("_HybridOptimizer needs at least one optimizer")
+        self.optimizers = list(optimizers)
+
+    @property
+    def param_groups(self):
+        groups = []
+        for o in self.optimizers:
+            groups.extend(o.param_groups)
+        return groups
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for o in self.optimizers:
+            o.zero_grad(set_to_none=set_to_none)
+
+    def step(self) -> None:
+        for o in self.optimizers:
+            o.step()
+
+    def state_dict(self):
+        return {"hybrid": [o.state_dict() for o in self.optimizers]}
+
+    def load_state_dict(self, state) -> None:
+        # New format: {"hybrid": [sd_per_optimizer, ...]}
+        if isinstance(state, dict) and "hybrid" in state:
+            payload = state["hybrid"]
+            if len(payload) != len(self.optimizers):
+                logger.warning(
+                    "Hybrid optimizer count mismatch (checkpoint=%d, current=%d); "
+                    "skipping optimizer state restoration.",
+                    len(payload), len(self.optimizers),
+                )
+                return
+            for o, sd in zip(self.optimizers, payload):
+                o.load_state_dict(sd)
+            return
+        # Legacy format: a single optimizer's state_dict (pre-Muon checkpoints).
+        if isinstance(state, dict) and "param_groups" in state and "state" in state:
+            if len(self.optimizers) == 1:
+                self.optimizers[0].load_state_dict(state)
+            else:
+                logger.warning(
+                    "Loading legacy single-optimizer checkpoint into hybrid setup; "
+                    "skipping optimizer state restoration."
+                )
+            return
+        raise ValueError("Unrecognized optimizer state_dict format")
+
+
+class _HybridScheduler:
+    """Holds one or more LR schedulers, mirroring ``_HybridOptimizer``."""
+
+    def __init__(self, *schedulers):
+        if not schedulers:
+            raise ValueError("_HybridScheduler needs at least one scheduler")
+        self.schedulers = list(schedulers)
+
+    def step(self) -> None:
+        for s in self.schedulers:
+            s.step()
+
+    def state_dict(self):
+        return {"hybrid": [s.state_dict() for s in self.schedulers]}
+
+    def load_state_dict(self, state) -> None:
+        if isinstance(state, dict) and "hybrid" in state:
+            payload = state["hybrid"]
+            if len(payload) != len(self.schedulers):
+                logger.warning(
+                    "Hybrid scheduler count mismatch (checkpoint=%d, current=%d); "
+                    "skipping scheduler state restoration.",
+                    len(payload), len(self.schedulers),
+                )
+                return
+            for s, sd in zip(self.schedulers, payload):
+                s.load_state_dict(sd)
+            return
+        if isinstance(state, dict) and len(self.schedulers) == 1:
+            self.schedulers[0].load_state_dict(state)
+            return
+        raise ValueError("Unrecognized scheduler state_dict format")
+
+
+def _build_optimizer_and_scheduler(
+    model: nn.Module, cfg: "TrainConfig"
+) -> tuple[_HybridOptimizer, _HybridScheduler]:
+    """Construct the Muon+AdamW hybrid (or pure AdamW if ``use_muon=False``)
+    along with matching cosine-with-warmup schedulers.
+
+    Args:
+        model: The model whose parameters will be optimized.
+        cfg: Training config.
+
+    Returns:
+        ``(optimizer, scheduler)`` — both wrappers around one or two underlying
+        torch optimizers/schedulers.
+    """
+    lr_lambda = lambda step: _cosine_with_warmup(  # noqa: E731
+        step, cfg.warmup_steps, cfg.max_steps, cfg.min_lr_ratio
+    )
+
+    if cfg.use_muon:
+        muon_params, adamw_params = split_params_for_muon(model)
+        if not muon_params:
+            logger.warning(
+                "Muon enabled but no 2D matrix parameters were found; falling back to AdamW only."
+            )
+            adamw_opt = torch.optim.AdamW(
+                model.parameters(), lr=cfg.lr,
+                weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+            )
+            return (
+                _HybridOptimizer(adamw_opt),
+                _HybridScheduler(torch.optim.lr_scheduler.LambdaLR(adamw_opt, lr_lambda)),
+            )
+
+        adamw_opt = torch.optim.AdamW(
+            adamw_params, lr=cfg.lr,
+            weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+        )
+        muon_opt = Muon(
+            muon_params,
+            lr=cfg.muon_lr,
+            momentum=cfg.muon_momentum,
+            nesterov=cfg.muon_nesterov,
+            ns_steps=cfg.muon_ns_steps,
+            weight_decay=cfg.muon_weight_decay,
+        )
+        logger.info(
+            "Hybrid optimizer: Muon (%d tensors / %.2fM params, lr=%.4f, momentum=%.2f) + "
+            "AdamW (%d tensors / %.2fM params, lr=%.2e)",
+            len(muon_params), sum(p.numel() for p in muon_params) / 1e6,
+            cfg.muon_lr, cfg.muon_momentum,
+            len(adamw_params), sum(p.numel() for p in adamw_params) / 1e6,
+            cfg.lr,
+        )
+        return (
+            _HybridOptimizer(adamw_opt, muon_opt),
+            _HybridScheduler(
+                torch.optim.lr_scheduler.LambdaLR(adamw_opt, lr_lambda),
+                torch.optim.lr_scheduler.LambdaLR(muon_opt, lr_lambda),
+            ),
+        )
+
+    adamw_opt = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr,
+        weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+    )
+    logger.info("Optimizer: AdamW (lr=%.2e, weight_decay=%.3f)", cfg.lr, cfg.weight_decay)
+    return (
+        _HybridOptimizer(adamw_opt),
+        _HybridScheduler(torch.optim.lr_scheduler.LambdaLR(adamw_opt, lr_lambda)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -448,15 +629,7 @@ def train(cfg: TrainConfig) -> None:
     act_schedule = ActivationSchedule(cfg.max_steps, cfg.a4_warmup_fraction)
     logger.info("Activation schedule: %s", act_schedule)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
-    )
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: _cosine_with_warmup(
-            step, cfg.warmup_steps, cfg.max_steps, cfg.min_lr_ratio
-        ),
-    )
+    optimizer, lr_scheduler = _build_optimizer_and_scheduler(model, cfg)
 
     # Mixed precision
     use_bf16 = cfg.bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
@@ -591,11 +764,16 @@ def train(cfg: TrainConfig) -> None:
             if step_in_accum < cfg.grad_accum_steps:
                 continue
 
-            # Optimizer step
-            scaler.unscale_(optimizer)
+            # Optimizer step — iterate underlying optimizers so GradScaler
+            # tracks per-optimizer state correctly when fp16 is in use. With
+            # bf16 (the default) the scaler is disabled and these calls are
+            # no-ops aside from optimizer.step() itself.
+            for inner_opt in optimizer.optimizers:
+                scaler.unscale_(inner_opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
             running_grad_norm += float(grad_norm)
-            scaler.step(optimizer)
+            for inner_opt in optimizer.optimizers:
+                scaler.step(inner_opt)
             scaler.update()
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -621,7 +799,9 @@ def train(cfg: TrainConfig) -> None:
                 avg_loss = running_loss / 50
                 avg_grad_norm = running_grad_norm / 50
                 avg_masked_frac = running_masked_frac / 50
-                lr = optimizer.param_groups[0]["lr"]
+                # Per-optimizer LR (one value when AdamW-only, two with Muon).
+                opt_lrs = [opt.param_groups[0]["lr"] for opt in optimizer.optimizers]
+                lr = opt_lrs[0]  # primary (AdamW) LR for the headline log line.
                 logger.info(
                     "step=%d  loss=%.4f  lr=%.2e  grad_norm=%.3f  masked_frac=%.3f  mode=%s",
                     global_step, avg_loss, lr, avg_grad_norm, avg_masked_frac, current_mode,
@@ -634,6 +814,8 @@ def train(cfg: TrainConfig) -> None:
                     "train/activation_mode": 0 if current_mode == "A8" else 1,
                     "train/epoch": epoch,
                 }
+                if len(opt_lrs) > 1:
+                    log_data["train/lr_muon"] = opt_lrs[1]
                 wandb_logger.log(log_data, step=global_step)
                 running_loss = 0.0
                 running_grad_norm = 0.0
