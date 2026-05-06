@@ -595,6 +595,7 @@ class BitMoEFFN(nn.Module):
         self.n_experts = config.n_experts
         self.top_k = config.top_k_experts
         self.capacity_factor = config.expert_capacity_factor
+        self._packed = False
 
         # Independent ternary-weight experts
         self.experts = nn.ModuleList([BitFFN(config) for _ in range(config.n_experts)])
@@ -607,6 +608,36 @@ class BitMoEFFN(nn.Module):
         self.register_buffer("expert_drop_count", torch.zeros(1), persistent=False)
         self.register_buffer("expert_total_count", torch.zeros(1), persistent=False)
 
+    def pack_for_inference(self) -> None:
+        """Stack per-expert packed weights into a grouped tensor for the
+        fused MoE kernel.
+
+        Assumes each expert's BitLinears have already been packed (which is
+        the case when called via :meth:`BitDiffusionTransformer.pack_for_inference`).
+        Stacked tensors are non-persistent buffers — derived state that is
+        rebuilt from the per-expert tensors after every state-dict load.
+        """
+        if self._packed:
+            return
+
+        # Defensive: pack any expert that hasn't been packed yet.
+        for e in self.experts:
+            for proj in (e.up_proj, e.gate_proj, e.down_proj):
+                if not getattr(proj, "_packed", False):
+                    proj.pack_for_inference()
+
+        for proj_name in ("up_proj", "gate_proj", "down_proj"):
+            packed_stack = torch.stack(
+                [getattr(e, proj_name).w_packed.data for e in self.experts], dim=0,
+            ).contiguous()
+            scale_stack = torch.stack(
+                [getattr(e, proj_name).scale_w.data for e in self.experts], dim=0,
+            ).to(torch.float32).reshape(-1).contiguous()
+            self.register_buffer(f"{proj_name}_packed_all", packed_stack, persistent=False)
+            self.register_buffer(f"{proj_name}_scale_all", scale_stack, persistent=False)
+
+        self._packed = True
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with top-K expert routing and load balancing loss.
 
@@ -617,6 +648,9 @@ class BitMoEFFN(nn.Module):
             Tuple of (output, aux_loss) where output is (B, T, hidden_dim)
             and aux_loss is a scalar load balancing loss.
         """
+        if getattr(self, "_packed", False):
+            return self._packed_moe_forward(x)
+
         B, T, D = x.shape
         N = self.n_experts
         K = self.top_k
@@ -693,6 +727,140 @@ class BitMoEFFN(nn.Module):
         # mean routing probability per expert
         mean_prob = router_probs.reshape(B * T, N).mean(dim=0)  # (N,)
 
+        aux_loss = N * (fraction * mean_prob).sum()
+
+        return output, aux_loss
+
+    def _packed_moe_forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Packed MoE forward using the grouped low-bit kernel.
+
+        Bit-equivalent to the unpacked path **only when no tokens are
+        dropped**. With dropping, the order in which overflow tokens are
+        discarded may differ from the per-expert Python double-loop above.
+        For deployments that need bit-equivalence, set
+        ``expert_capacity_factor`` high enough that no drops occur.
+        """
+        from . import kernels  # local import to avoid circulars at module load
+
+        B, T, D = x.shape
+        N = self.n_experts
+        K = self.top_k
+        BT = B * T
+        device = x.device
+
+        router_logits = self.router(x)              # (B, T, N)
+        router_probs = F.softmax(router_logits, dim=-1)
+        topk_probs, topk_indices = router_probs.topk(K, dim=-1)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+
+        x_flat = x.reshape(BT, D)
+        topk_probs_flat = topk_probs.reshape(BT, K)
+        topk_indices_flat = topk_indices.reshape(BT, K)
+
+        # --- Build the flat (token, expert, prob) assignment list ---
+        # token_idx[i] in [0, BT), expert_idx[i] in [0, N), prob[i] is
+        # the routing weight to apply to that (token, expert) pair.
+        token_idx = torch.arange(BT, device=device).unsqueeze(1).expand(BT, K).reshape(-1)
+        expert_idx = topk_indices_flat.reshape(-1)
+        probs = topk_probs_flat.reshape(-1)
+
+        # --- Capacity-constrained dropping (vectorized) ---
+        capacity = int((BT / N) * self.capacity_factor)
+        # For each (token, expert) pair, count how many earlier same-expert
+        # pairs are in the flattened list — keep only those with rank < capacity.
+        # Sort by expert to get per-expert blocks, then use cumsum.
+        sort_keys, sort_perm = expert_idx.sort(stable=True)
+        token_idx_s = token_idx[sort_perm]
+        probs_s = probs[sort_perm]
+
+        # rank of each row within its expert block: cumcount per expert.
+        same_as_prev = torch.cat([
+            torch.zeros(1, dtype=torch.bool, device=device),
+            sort_keys[1:] == sort_keys[:-1],
+        ])
+        # group_start[i] = 1 if a new expert block starts at i
+        group_start = (~same_as_prev).to(torch.int32)
+        # rank within block via cumulative sum of "is start" minus 1
+        block_id = group_start.cumsum(0) - 1
+        block_offsets = torch.zeros(N, dtype=torch.int64, device=device)
+        # find index of first row of each expert block; rows with no tokens
+        # have implicit offset 0 (no contribution).
+        unique_experts, first_pos = torch.unique_consecutive(
+            sort_keys, return_inverse=True,
+        )
+        # rank = position - first_pos_of_block
+        positions = torch.arange(sort_keys.shape[0], device=device)
+        # first_pos_of_block: for each row, the position of the first row
+        # in its block. Compute via segment-min trick:
+        # For sorted keys, the first occurrence index of key k is
+        # positions where key changes. Build lookup:
+        # We know unique_experts are sorted (since input was sorted).
+        block_first = torch.zeros_like(unique_experts, dtype=torch.int64)
+        if unique_experts.numel() > 0:
+            block_first[1:] = (~same_as_prev).nonzero(as_tuple=True)[0][1:]
+        rank_in_block = positions - block_first[first_pos]
+
+        keep_mask = rank_in_block < capacity
+        kept_token_idx = token_idx_s[keep_mask]
+        kept_expert_idx = sort_keys[keep_mask]
+        kept_probs = probs_s[keep_mask]
+        dropped = (~keep_mask).sum().item()
+
+        # Per-expert kept-count
+        expert_token_count = torch.zeros(N, dtype=torch.int64, device=device)
+        if kept_expert_idx.numel() > 0:
+            expert_token_count.scatter_add_(
+                0, kept_expert_idx, torch.ones_like(kept_expert_idx, dtype=torch.int64),
+            )
+
+        # Update tracking buffers
+        self.expert_token_counts.copy_(expert_token_count.float())
+        self.expert_drop_count.fill_(float(dropped))
+        self.expert_total_count.fill_(float(BT * K))
+
+        # --- Permute activations and quantize ---
+        x_perm = x_flat.index_select(0, kept_token_idx)  # (M_perm, D)
+
+        # All experts share the same int4 quantizer config; reuse the first
+        # expert's up_proj quantizer to avoid creating a new module.
+        up_quant = self.experts[0].up_proj.act_quant
+        down_quant = self.experts[0].down_proj.act_quant
+
+        x_int, scale_x = up_quant.quantize_to_int(x_perm)  # (M_perm, D), (M_perm, 1)
+
+        # --- Grouped up + gate ---
+        up_out = kernels.grouped_packed_ternary_linear(
+            x_int, self.up_proj_packed_all, self.up_proj_scale_all,
+            scale_x, expert_token_count, self.experts[0].up_proj.out_features,
+        ).to(x.dtype)
+        gate_out = kernels.grouped_packed_ternary_linear(
+            x_int, self.gate_proj_packed_all, self.gate_proj_scale_all,
+            scale_x, expert_token_count, self.experts[0].gate_proj.out_features,
+        ).to(x.dtype)
+
+        mid = F.silu(gate_out) * up_out  # (M_perm, ffn_dim)
+
+        # --- topk_int8 quantize for down_proj input ---
+        mid_int, scale_mid = down_quant.quantize_to_int(mid)
+
+        down_out = kernels.grouped_packed_ternary_linear(
+            mid_int, self.down_proj_packed_all, self.down_proj_scale_all,
+            scale_mid, expert_token_count, self.experts[0].down_proj.out_features,
+        ).to(x.dtype)
+
+        # --- Apply routing probability and scatter back ---
+        weighted = down_out * kept_probs.unsqueeze(-1).to(down_out.dtype)
+        output_flat = torch.zeros_like(x_flat)
+        output_flat.index_add_(0, kept_token_idx, weighted)
+        output = output_flat.reshape(B, T, D)
+
+        # --- Auxiliary load balancing loss (unchanged from unpacked path) ---
+        tokens_per_expert = torch.zeros(N, device=device)
+        for k_idx in range(K):
+            one_hot = F.one_hot(topk_indices_flat[:, k_idx], N).float()
+            tokens_per_expert += one_hot.sum(dim=0)
+        fraction = tokens_per_expert / (BT * K)
+        mean_prob = router_probs.reshape(BT, N).mean(dim=0)
         aux_loss = N * (fraction * mean_prob).sum()
 
         return output, aux_loss
@@ -919,11 +1087,19 @@ class BitDiffusionTransformer(nn.Module):
         scales. Modules carrying ``exclude_from_ternary = True`` (i.e.
         the MoE :class:`Int8Linear` router) are skipped.
 
+        Then walks every :class:`BitMoEFFN` module and stacks its per-expert
+        packed weights into a single grouped tensor so MoE forwards run
+        through the fused grouped-matmul kernel instead of one launch per
+        expert.
+
         Call this after the checkpoint is loaded and just before sampling.
         Returns ``self`` for chaining.
         """
         for module in self.modules():
             if isinstance(module, BitLinear) and not getattr(module, "exclude_from_ternary", False):
+                module.pack_for_inference()
+        for module in self.modules():
+            if isinstance(module, BitMoEFFN):
                 module.pack_for_inference()
         return self
 

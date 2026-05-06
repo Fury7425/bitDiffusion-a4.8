@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bitdiffusion import kernels  # noqa: E402
-from bitdiffusion.model import BitDiffusionTransformer, BitLinear, ModelConfig  # noqa: E402
+from bitdiffusion.model import BitDiffusionTransformer, BitLinear, BitMoEFFN, ModelConfig  # noqa: E402
 
 
 def _packed_param_bytes(model: torch.nn.Module) -> int:
@@ -209,6 +209,128 @@ class TestStateDictRoundTrip(unittest.TestCase):
             y_loaded = m2(ids, t)[0]
         max_abs = (y_ref - y_loaded).abs().max().item()
         self.assertLess(max_abs, 1e-5, f"round-trip max abs diff = {max_abs}")
+
+
+class TestCPUWeightCache(unittest.TestCase):
+    """The CPU fallback should reuse a single unpacked tensor across calls."""
+
+    def test_unpacked_cache_reused(self):
+        torch.manual_seed(0)
+        layer = BitLinear(64, 128, act_mode="int4").eval()
+        x = torch.randn(2, 8, 64)
+        with torch.no_grad():
+            _ = layer(x)
+        layer.pack_for_inference()
+        kernels._clear_unpack_cache()
+
+        with torch.no_grad():
+            _ = layer(x)
+        first = kernels._get_cached_unpacked_t(layer.w_packed)
+        with torch.no_grad():
+            _ = layer(x)
+        second = kernels._get_cached_unpacked_t(layer.w_packed)
+        self.assertIs(first, second)
+
+
+class TestGroupedKernelStandalone(unittest.TestCase):
+    """The grouped kernel must agree with per-expert dispatch on the CPU path."""
+
+    def test_grouped_matches_per_expert_loop(self):
+        torch.manual_seed(0)
+        G, N, K = 3, 64, 32
+        M_perm = 20
+        counts = torch.tensor([7, 5, 8])
+
+        w_q_stack = torch.randint(-1, 2, (G, N, K), dtype=torch.int8)
+        packed_stack = torch.stack([kernels.pack_ternary_2bit(w_q_stack[g]) for g in range(G)])
+        scale_w_all = torch.rand(G).abs() + 0.1
+        x_int = torch.randint(-7, 8, (M_perm, K), dtype=torch.int8)
+        scale_x = torch.rand(M_perm) + 0.5
+
+        ref = torch.zeros(M_perm, N)
+        cur = 0
+        for g in range(G):
+            m_e = int(counts[g])
+            sl_x = x_int[cur:cur + m_e]
+            sl_s = scale_x[cur:cur + m_e]
+            ref[cur:cur + m_e] = kernels.packed_ternary_linear(
+                sl_x, packed_stack[g], scale_w_all[g], sl_s.unsqueeze(-1), N,
+            )
+            cur += m_e
+
+        got = kernels.grouped_packed_ternary_linear(
+            x_int, packed_stack, scale_w_all, scale_x, counts, N,
+        )
+        self.assertTrue(torch.allclose(got, ref, atol=1e-5))
+
+
+class TestGroupedMoEPacked(unittest.TestCase):
+    """End-to-end equivalence: BitMoEFFN float-sim vs grouped packed forward."""
+
+    def _make_moe(self, n_experts: int = 4, top_k: int = 2) -> BitMoEFFN:
+        cfg = ModelConfig(
+            vocab_size=64, hidden_dim=64, n_layers=1, n_heads=4,
+            ffn_dim=128, max_seq_len=64, t_embed_dim=64,
+            N_think=0, think_prob=0.0,
+            use_moe=True, n_experts=n_experts, top_k_experts=top_k,
+            expert_capacity_factor=8.0,  # large enough to disable dropping
+        )
+        torch.manual_seed(0)
+        return BitMoEFFN(cfg).eval()
+
+    def test_packed_moe_matches_float_sim(self):
+        moe = self._make_moe()
+        x = torch.randn(2, 16, 64)
+
+        with torch.no_grad():
+            y_pre, aux_pre = moe(x)
+        moe.pack_for_inference()
+        with torch.no_grad():
+            y_post, aux_post = moe(x)
+
+        # aux_loss only depends on the router; should be bit-identical.
+        self.assertTrue(torch.allclose(aux_pre, aux_post, atol=1e-6))
+
+        denom = y_pre.abs().max().item() + 1e-8
+        rel = (y_pre - y_post).abs().max().item() / denom
+        # MoE path goes int8 matmul -> float scales -> SwiGLU -> topk_int8
+        # quant -> int8 matmul. Topk's near-cut indices are sensitive to
+        # tiny FP perturbations from int_mm vs float matmul ordering, so
+        # exact equivalence is not achievable. 1.5% is a realistic bound
+        # well below "broken model" territory.
+        self.assertLess(rel, 1.5e-2,
+                        f"packed MoE relative error {rel:.2e} too high")
+
+    def test_state_dict_round_trip_with_moe(self):
+        moe = self._make_moe()
+        moe.pack_for_inference()
+        x = torch.randn(2, 8, 64)
+        with torch.no_grad():
+            y_ref, aux_ref = moe(x)
+
+        # Stacked buffers are non-persistent so the saved state dict still
+        # holds per-expert w_packed tensors.
+        sd = moe.state_dict()
+        stacked = [k for k in sd if k.endswith("packed_all")]
+        self.assertFalse(stacked,
+                         f"stacked tensors should not be saved: {stacked}")
+
+        # Re-instantiate and re-pack
+        cfg = moe.config
+        torch.manual_seed(0)
+        moe2 = BitMoEFFN(cfg).eval()
+        missing, unexpected = moe2.load_state_dict(sd, strict=False)
+        # Per-expert latent_weights are missing because we packed before saving.
+        for k in missing:
+            self.assertTrue(k.endswith("latent_weight"),
+                            f"unexpected missing key: {k}")
+        self.assertFalse(unexpected, f"unexpected keys: {unexpected}")
+
+        moe2.pack_for_inference()
+        with torch.no_grad():
+            y_load, aux_load = moe2(x)
+        self.assertTrue(torch.allclose(y_ref, y_load, atol=1e-6))
+        self.assertTrue(torch.allclose(aux_ref, aux_load, atol=1e-6))
 
 
 if __name__ == "__main__":
