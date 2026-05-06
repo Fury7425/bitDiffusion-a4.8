@@ -171,6 +171,46 @@ class HybridQuantizer(nn.Module):
         # STE: forward uses quantized, backward flows to original
         return x_q.detach() + x - x.detach()
 
+    def quantize_to_int(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize-only: return raw INT tensor + per-token scale (no dequant).
+
+        Used by the packed inference path where the integer tensor is fed
+        directly to a low-bit kernel. Output dtype is ``torch.int8``;
+        for ``"int4"`` mode values lie in ``[-7, 7]`` and for INT8 modes in
+        ``[-127, 127]``. The returned scale follows the same convention as
+        the simulated path: the dequantized activation equals
+        ``x_int.to(float) / scale``.
+
+        Args:
+            x: Input activation tensor of shape ``(..., D)``.
+
+        Returns:
+            Tuple ``(x_int, scale)``. ``scale`` has shape ``(..., 1)``.
+        """
+        if not self.enabled:
+            # Pass-through: emulate INT8 with no rounding using a unit scale.
+            scale = torch.ones((*x.shape[:-1], 1), dtype=torch.float32, device=x.device)
+            return x.to(torch.int8), scale
+
+        if self.mode == "int4":
+            amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            scale = 7.0 / amax
+            x_q = (x * scale).round().clamp(-7, 7).to(torch.int8)
+            return x_q, scale.to(torch.float32)
+        if self.mode == "int8":
+            amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            scale = 127.0 / amax
+            x_q = (x * scale).round().clamp(-127, 127).to(torch.int8)
+            return x_q, scale.to(torch.float32)
+        if self.mode == "topk_int8":
+            x_s = topk_sparsify(x, self.topk_ratio)
+            amax = x_s.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            scale = 127.0 / amax
+            x_q = (x_s * scale).round().clamp(-127, 127).to(torch.int8)
+            return x_q, scale.to(torch.float32)
+
+        raise ValueError(f"quantize_to_int: unsupported mode {self.mode!r}")
+
     def extra_repr(self) -> str:
         return f"mode={self.mode}, topk_ratio={self.topk_ratio}, enabled={self.enabled}"
 

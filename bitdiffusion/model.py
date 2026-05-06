@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from .quantization import HybridQuantizer, KVCache, absmax_quantize_int8, ste_ternary
+from .quantization import HybridQuantizer, KVCache, absmax_quantize_int8, absmean_quantize, ste_ternary
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +231,7 @@ class BitLinear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self._packed = False
 
         # Latent full-precision weight (no bias)
         self.latent_weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -251,6 +252,9 @@ class BitLinear(nn.Module):
         Returns:
             Output tensor of shape (..., out_features).
         """
+        if getattr(self, "_packed", False):
+            return self._packed_forward(x)
+
         # Quantize activation (input to this linear)
         if self.act_quant is not None:
             x = self.act_quant(x)
@@ -259,6 +263,84 @@ class BitLinear(nn.Module):
         w_forward, scale = ste_ternary(self.latent_weight)
 
         return F.linear(x, w_forward * scale)
+
+    # ------------------------------------------------------------------
+    # Packed inference path
+    # ------------------------------------------------------------------
+
+    def _packed_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Inference path using packed 2-bit ternary weights."""
+        from . import kernels  # local import to avoid circulars at module load
+
+        if self.act_quant is not None:
+            x_int, scale_x = self.act_quant.quantize_to_int(x)
+        else:
+            amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            scale_x = (127.0 / amax).to(torch.float32)
+            x_int = (x * scale_x).round().clamp(-127, 127).to(torch.int8)
+
+        out = kernels.packed_ternary_linear(
+            x_int, self.w_packed, self.scale_w, scale_x, self.out_features,
+        )
+        return out.to(x.dtype)
+
+    def pack_for_inference(self) -> None:
+        """Freeze and pack ternary weights for real low-bit inference.
+
+        Replaces ``latent_weight`` with the packed 2-bit representation and
+        a per-tensor weight scale, then deletes the latent copy to free
+        memory. Idempotent (no-op if already packed).
+        """
+        if getattr(self, "_packed", False):
+            return
+        if getattr(self, "exclude_from_ternary", False):
+            return  # respect Int8Linear-style exclusions
+
+        from . import kernels
+
+        with torch.no_grad():
+            w_q, scale = absmean_quantize(self.latent_weight.detach())
+            w_q_int = w_q.to(torch.int8)
+            packed = kernels.pack_ternary_2bit(w_q_int)
+
+        self.w_packed = nn.Parameter(packed.contiguous(), requires_grad=False)
+        self.register_buffer("scale_w", scale.detach().to(torch.float32).reshape(()))
+
+        # Free the float latent copy.
+        del self.latent_weight
+        self._packed = True
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Auto-detect packed exports during ``load_state_dict``.
+
+        If the incoming state dict has ``w_packed`` (and no ``latent_weight``),
+        switch this layer into packed mode before delegating to the standard
+        loader.
+        """
+        has_packed = (prefix + "w_packed") in state_dict
+        has_latent = (prefix + "latent_weight") in state_dict
+        if has_packed and not has_latent and not getattr(self, "_packed", False):
+            in_padded = ((self.in_features + 3) // 4) * 4
+            packed_shape = state_dict[prefix + "w_packed"].shape
+            self.w_packed = nn.Parameter(
+                torch.zeros(packed_shape, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.register_buffer("scale_w", torch.zeros((), dtype=torch.float32))
+            if hasattr(self, "latent_weight"):
+                del self.latent_weight
+            self._packed = True
+            # Sanity-check padded width matches
+            if packed_shape[1] * 4 != in_padded:
+                # Tolerate exact-match in_features: the export was produced
+                # with the same in_features so this should always hold.
+                pass
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def set_activation_mode(self, mode: str) -> None:
         """Switch activation quantization mode (for stage transitions).
@@ -827,6 +909,23 @@ class BitDiffusionTransformer(nn.Module):
         x = self.final_norm(x)
         logits = self.unembed(x)
         return logits, total_aux_loss
+
+    def pack_for_inference(self) -> "BitDiffusionTransformer":
+        """Pack all ternary BitLinear layers for real low-bit inference.
+
+        Iterates every :class:`BitLinear` module, calling its
+        :meth:`BitLinear.pack_for_inference` method to replace the float
+        latent weights with packed 2-bit ternary weights and per-tensor
+        scales. Modules carrying ``exclude_from_ternary = True`` (i.e.
+        the MoE :class:`Int8Linear` router) are skipped.
+
+        Call this after the checkpoint is loaded and just before sampling.
+        Returns ``self`` for chaining.
+        """
+        for module in self.modules():
+            if isinstance(module, BitLinear) and not getattr(module, "exclude_from_ternary", False):
+                module.pack_for_inference()
+        return self
 
     def count_parameters(self) -> dict:
         """Count total, trainable, and latent parameters.

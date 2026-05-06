@@ -114,6 +114,17 @@ def export_checkpoint(args: argparse.Namespace) -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer) if args.tokenizer else None
     model, ckpt, config = load_model_from_checkpoint(args, tokenizer=tokenizer)
 
+    packed = False
+    if getattr(args, "pack", False):
+        if not hasattr(model, "pack_for_inference"):
+            raise ValueError(
+                f"Model type {type(model).__name__} does not support --pack. "
+                "Only BitDiffusionTransformer-derived models can be packed."
+            )
+        logger.info("Packing ternary BitLinear weights for low-bit inference")
+        model.pack_for_inference()
+        packed = True
+
     if args.format == "gguf":
         raise ValueError(
             "GGUF export is not supported for this architecture. "
@@ -151,6 +162,8 @@ def export_checkpoint(args: argparse.Namespace) -> None:
             "consumers such as llama.cpp."
         ),
     }
+    if packed:
+        metadata["packed"] = True
     metadata_path = os.path.join(args.output_dir, "export_metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, sort_keys=True)
@@ -220,6 +233,16 @@ def main() -> None:
     )
     parser.add_argument("--aux_loss_weight", type=float, default=0.01)
     parser.add_argument("--expert_capacity_factor", type=float, default=1.25)
+    parser.add_argument(
+        "--pack",
+        action="store_true",
+        help=(
+            "Pack ternary BitLinear weights into 2-bit form before saving. "
+            "Drops the float latent_weight tensors and writes w_packed/scale_w "
+            "instead, producing a ~16x smaller export ready for low-bit "
+            "inference. Resulting files are no longer trainable."
+        ),
+    )
 
     args = parser.parse_args()
     export_checkpoint(args)
