@@ -18,6 +18,7 @@ absorbing-state diffusion objective, quantized KV cache, and latent scratchpad t
 | Activations | INT4 inputs + TopK(55%) + INT8 intermediates | float16 |
 | KV Cache | 3-bit quantized (TurboQuant-style rotation) | float16 |
 | Thinking | 64-token latent scratchpad (adaptive) | Chain-of-thought in prompt |
+| Inference weights | Packed 2-bit ternary + Triton/CPU INT4×INT8 kernel | Float16 GEMM |
 | Context | 4,096 tokens | Varies |
 | Training stages | Two-stage A8 → A4 activation schedule | Single stage |
 
@@ -64,6 +65,23 @@ python sample.py \
     --prompt "Explain how neural networks learn" \
     --length 300 \
     --verbose
+```
+
+### Run with real packed (2-bit) weights
+
+After loading any checkpoint, call `pack_for_inference()` once to swap the
+float ternary simulation for the real low-bit kernel — ~16x smaller weight
+tensors and a real GPU compute speedup (see [Low-bit packed inference](#low-bit-packed-inference)).
+
+```python
+import torch
+from bitdiffusion import BitDiffusionTransformer, ModelConfig
+
+ckpt = torch.load("checkpoints/step_57500.pt", weights_only=True)
+cfg = ModelConfig(**ckpt["model_config"])
+model = BitDiffusionTransformer(cfg)
+model.load_state_dict(ckpt["model_state_dict"])
+model.eval().pack_for_inference()  # one-time, before sampling
 ```
 
 ---
@@ -184,6 +202,10 @@ python train.py
 ```
 
 Runs 57,500 steps × (8 batch × 16 grad accum × 4,096 seq) = **30.1B tokens**.
+
+> Training stays on the float-sim path. **Never call
+> `pack_for_inference()` during training** — packed BitLinears are not
+> differentiable. Packing is an inference-only, one-way operation.
 
 **Resume after preemption:**
 ```bash
@@ -347,19 +369,132 @@ Produces:
 
 ---
 
+## Low-bit packed inference
+
+Training keeps full-precision **latent** weights and quantizes them on every
+forward pass via straight-through estimator — the model on disk is a regular
+float checkpoint. Inference, by default, simulates the same quantization in
+float and gets no speedup.
+
+The packed-inference path replaces this simulation with a real INT4 × 2-bit
+ternary compute kernel:
+
+| | Training | Default inference (float-sim) | Packed inference |
+|---|---|---|---|
+| Weight dtype on disk | fp32 latent | fp32 latent | uint8 (2 bits/param) |
+| Activation compute | float | float (rounded) | INT8 dot-product |
+| Weight bytes | 4×params | 4×params | params/4 (16× smaller than fp16) |
+| Speedup vs fp16 | n/a | none | hardware-dependent (Triton kernel) |
+| Trainable | yes | yes | **no** |
+
+### Pack at export time
+
+```bash
+python export.py \
+    --checkpoint checkpoints/step_57500.pt \
+    --output_dir exports/packed \
+    --format safetensors \
+    --tokenizer Qwen/Qwen-tokenizer \
+    --pack
+```
+
+`--pack` runs `pack_for_inference()` before serializing, drops every
+`latent_weight` tensor, and emits `w_packed` + `scale_w` per BitLinear. The
+exported file is roughly 16× smaller than an fp16 export. The metadata
+file gains `"packed": true`.
+
+### Pack at runtime
+
+If your checkpoint isn't pre-packed, do it once after `load_state_dict`:
+
+```python
+model = BitDiffusionTransformer(cfg)
+model.load_state_dict(ckpt["model_state_dict"])
+model.eval().pack_for_inference()
+# every BitLinear in attention + FFN is now packed; MoE FFNs stack
+# their per-expert weights into a single grouped-matmul tensor.
+```
+
+### Loading a packed export
+
+`BitLinear._load_from_state_dict` auto-detects packed exports — if the
+state dict has `w_packed` (and no `latent_weight`), the layer flips into
+packed mode automatically:
+
+```python
+sd = load_file("exports/packed/model.safetensors")  # or torch.load(...)
+model = BitDiffusionTransformer(cfg)
+model.load_state_dict(sd)         # works without code changes
+# For MoE models, re-stack the expert weights:
+if any(isinstance(m, BitMoEFFN) for m in model.modules()):
+    model.pack_for_inference()    # idempotent for already-packed BitLinears
+```
+
+### Dispatch rules
+
+`bitdiffusion.kernels.packed_ternary_linear` picks a backend per call:
+
+| Device | Backend |
+|---|---|
+| CUDA / ROCm with `triton` installed | Autotuned Triton kernel (INT8 `tl.dot` → INT32 accumulator) |
+| Intel XPU with `triton` (via `intel-extension-for-pytorch`) | Same Triton kernel |
+| CPU | `torch._int_mm` if available, otherwise int32 `torch.mm` (correctness, not throughput) |
+| Anywhere `triton` import fails | Silent fallback to the CPU path |
+
+The MoE path uses a fused **grouped** kernel: tokens are permuted by their
+assigned expert, the per-expert packed weights are stacked into a
+`(n_experts, out, in_padded//4)` tensor, and one kernel handles the whole
+ragged batch instead of `n_experts × top_k_experts` separate launches.
+
+### Caveats
+
+- **Training must stay on the float-sim path.** Never call
+  `pack_for_inference()` during training — packed BitLinears are not
+  differentiable and `latent_weight` is deleted to free memory.
+- **MoE bit-equivalence requires no token drops.** The grouped path uses
+  vectorized capacity dropping, while the unpacked Python loop uses
+  first-come-first-served per `(top_k_slot, expert)`. Set
+  `expert_capacity_factor` high enough that no drops occur if you need
+  exact bit-equivalence with the training-time forward.
+- **Numerical drift.** `topk_int8` activation quantization is sensitive
+  to tiny FP noise from `int_mm`-vs-float matmul ordering, so end-to-end
+  outputs can drift ~1% relative even though every individual `BitLinear`
+  is bit-perfect against the float-sim path.
+
+### Benchmarking
+
+`scripts/bench_packed_linear.py` compares an FP16 reference, the
+float-sim packed path, and the real packed path for a sweep of shapes.
+CUDA-only — exits cleanly on CPU machines.
+
+```bash
+python scripts/bench_packed_linear.py --shapes 768,1024,2048,4096
+python scripts/bench_packed_linear.py --batch 1 --seq 1024
+```
+
+Numbers depend heavily on the GPU SKU; this repo does not ship pre-measured
+throughput tables. Run the script on your hardware to validate.
+
+---
+
 ## File Structure
 
 ```
 bitdiffusion/
-├── model.py          # BitLinear, BitAttention, BitFFN, BitDiffusionTransformer
+├── model.py          # BitLinear, BitAttention, BitFFN, BitMoEFFN, BitDiffusionTransformer
 ├── rdt.py            # BitRDTTransformer — Recurrent-Depth Transformer variant
 ├── quantization.py   # HybridQuantizer, KVCache, TurboQuant rotation, absmax/TopK
+├── kernels.py        # 2-bit pack/unpack, INT4×ternary Triton kernel + CPU fallback,
+│                     # grouped MoE-expert kernel, AOT compile probe
 ├── diffusion.py      # CosineSchedule, MaskDiffusionLoss, masking utilities
 ├── data.py           # StreamingJsonlDataset, variable-length chunking, DataLoader
 ├── train.py          # Training loop, TrainConfig, ActivationSchedule, main()
 ├── sample.py         # ThinkingDiffusionSampler, BlockDiffusionSampler, auto-length
-├── export.py         # Checkpoint export to safetensors / PyTorch
+├── export.py         # Checkpoint export to safetensors / PyTorch (with --pack)
 └── utils.py          # BitStats, checkpoint save/load, logging, WandB wrapper
+
+scripts/
+└── bench_packed_linear.py  # GPU benchmark: fp16 vs float-sim vs real packed
 
 prepare_hf_jsonl.py   # 40B token data pipeline (HuggingFace streaming)
 train.py              # CLI entry point for bitdiffusion.train
