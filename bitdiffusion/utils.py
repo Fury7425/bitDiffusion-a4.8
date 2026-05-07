@@ -13,6 +13,7 @@ Includes:
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import time
@@ -258,6 +259,49 @@ def validate_model_config_topology(
         raise ValueError(f"{context} model_config does not match the requested topology: {details}")
 
 
+# ---------------------------------------------------------------------------
+# Async checkpoint I/O
+# ---------------------------------------------------------------------------
+
+_ckpt_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_pending_ckpt: Optional[concurrent.futures.Future] = None
+
+
+def _get_ckpt_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _ckpt_executor
+    if _ckpt_executor is None:
+        _ckpt_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ckpt-writer"
+        )
+    return _ckpt_executor
+
+
+def drain_checkpoint_writer() -> None:
+    """Block until any in-flight async checkpoint write finishes."""
+    global _pending_ckpt
+    if _pending_ckpt is not None and not _pending_ckpt.done():
+        logger.info("Waiting for background checkpoint write to complete…")
+        _pending_ckpt.result()
+    _pending_ckpt = None
+
+
+def _clone_state_dict(obj: Any) -> Any:
+    """Recursively clone tensors to CPU, preserving nested dict/list structure."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, dict):
+        return {k: _clone_state_dict(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        cloned = [_clone_state_dict(v) for v in obj]
+        return type(obj)(cloned)
+    return obj
+
+
+def _write_checkpoint_file(path: str, ckpt: Dict, step: int) -> None:
+    torch.save(ckpt, path)
+    logger.info("Checkpoint saved to %s (step %d)", path, step)
+
+
 def save_checkpoint(
     path: str,
     model: nn.Module,
@@ -266,8 +310,14 @@ def save_checkpoint(
     step: int,
     activation_mode: str,
     extra: Optional[Dict[str, Any]] = None,
+    async_io: bool = False,
 ) -> None:
     """Save a training checkpoint.
+
+    When ``async_io=True`` the file write is offloaded to a background
+    thread so training can resume immediately.  Model and optimizer states
+    are cloned to CPU synchronously before the thread is launched, so the
+    snapshot is consistent regardless of in-flight gradient updates.
 
     Args:
         path: File path for the checkpoint.
@@ -277,12 +327,26 @@ def save_checkpoint(
         step: Current global step.
         activation_mode: Current activation quantization mode string.
         extra: Any additional metadata to save.
+        async_io: If True, write the file in a background thread.
     """
+    global _pending_ckpt
+
+    # Drain any previous async write before we clone new state (prevents
+    # the writer thread from racing with the upcoming clone).
+    drain_checkpoint_writer()
+
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+
+    # Clone all tensor state to CPU *synchronously* so training can resume
+    # while the background thread serialises to disk.
+    model_sd = _clone_state_dict(model.state_dict())
+    opt_sd = _clone_state_dict(optimizer.state_dict())
+    sched_sd = _clone_state_dict(scheduler.state_dict()) if scheduler is not None else None
+
+    ckpt: Dict[str, Any] = {
+        "model_state_dict": model_sd,
+        "optimizer_state_dict": opt_sd,
+        "scheduler_state_dict": sched_sd,
         "step": step,
         "activation_mode": activation_mode,
     }
@@ -298,8 +362,12 @@ def save_checkpoint(
             logger.warning("Failed to serialize rdt_config into checkpoint metadata")
     if extra:
         ckpt["extra"] = extra
-    torch.save(ckpt, path)
-    logger.info("Checkpoint saved to %s (step %d)", path, step)
+
+    if async_io:
+        _pending_ckpt = _get_ckpt_executor().submit(_write_checkpoint_file, path, ckpt, step)
+        logger.info("Checkpoint write queued (async): %s (step %d)", path, step)
+    else:
+        _write_checkpoint_file(path, ckpt, step)
 
 
 def load_checkpoint(

@@ -7,17 +7,25 @@ Streaming dataset and data loading utilities for BitDiffusion a4.8.
 Provides a lazy-reading JSONL dataset that does not load entire corpora
 into memory, a collation function for variable-length sequences, and a
 factory for constructing DataLoaders.
+
+Also provides PreTokenizedDataset / make_pretokenized_dataloader for
+the fast-path where the corpus has been pre-tokenized to .pt shards via
+pretokenize_dataset(), eliminating per-document tokenizer overhead during
+training.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 from typing import Dict, Iterator, List, Optional
 
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
+
+logger = logging.getLogger("bitdiffusion")
 
 
 class StreamingJsonlDataset(IterableDataset):
@@ -195,4 +203,175 @@ def make_dataloader(
         num_workers=num_workers,
         collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
         pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=(2 if num_workers > 0 else None),
     )
+
+
+# ---------------------------------------------------------------------------
+# Pre-tokenized dataset (fast path for large corpora)
+# ---------------------------------------------------------------------------
+
+class PreTokenizedDataset(IterableDataset):
+    """Loads pre-tokenized chunks from binary ``.pt`` shards.
+
+    Each shard is a list of 1-D ``torch.long`` tensors produced by
+    :func:`pretokenize_dataset`. Loading from shards avoids per-document
+    tokenization during training, which is the dominant CPU bottleneck
+    for large corpora.
+
+    Args:
+        paths: ``.pt`` shard file paths (glob-expanded by the caller).
+        max_length: Maximum chunk length; longer chunks are split.
+        shuffle_buffer_size: In-memory shuffle buffer depth.
+        min_chunk_size: Minimum chunk length; shorter chunks are discarded.
+    """
+
+    def __init__(
+        self,
+        paths: List[str],
+        max_length: int = 4096,
+        shuffle_buffer_size: int = 8192,
+        min_chunk_size: int = 16,
+    ):
+        super().__init__()
+        self.paths = sorted(paths)
+        self.max_length = max_length
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.min_chunk_size = min_chunk_size
+
+    def _shard_files(self) -> List[str]:
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            return self.paths
+        return [p for i, p in enumerate(self.paths) if i % worker_info.num_workers == worker_info.id]
+
+    def _produce_chunks(self, files: List[str]) -> Iterator[Dict[str, torch.Tensor]]:
+        for path in files:
+            chunks: List[torch.Tensor] = torch.load(path, weights_only=True)
+            for ids in chunks:
+                if ids.numel() < self.min_chunk_size:
+                    continue
+                for start in range(0, ids.numel(), self.max_length):
+                    chunk = ids[start : start + self.max_length]
+                    if chunk.numel() >= self.min_chunk_size:
+                        yield {"input_ids": chunk.clone()}
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        files = self._shard_files()
+        if self.shuffle_buffer_size <= 1:
+            yield from self._produce_chunks(files)
+            return
+
+        buf: List[Dict[str, torch.Tensor]] = []
+        rng = random.Random()
+        for example in self._produce_chunks(files):
+            buf.append(example)
+            if len(buf) >= self.shuffle_buffer_size:
+                idx = rng.randrange(len(buf))
+                buf[idx], buf[-1] = buf[-1], buf[idx]
+                yield buf.pop()
+        rng.shuffle(buf)
+        yield from buf
+
+
+def make_pretokenized_dataloader(
+    paths: List[str],
+    max_length: int = 4096,
+    batch_size: int = 8,
+    num_workers: int = 4,
+    pad_token_id: int = 0,
+    shuffle_buffer_size: int = 8192,
+) -> DataLoader:
+    """Create a DataLoader from pre-tokenized ``.pt`` shards.
+
+    Use this instead of :func:`make_dataloader` when the corpus has been
+    pre-processed with :func:`pretokenize_dataset`.  Throughput is typically
+    3-5× higher because tokenization is not repeated on every epoch.
+
+    Args:
+        paths: List of ``.pt`` shard paths.
+        max_length: Maximum sequence length.
+        batch_size: Batch size.
+        num_workers: DataLoader worker count.
+        pad_token_id: Padding token ID.
+        shuffle_buffer_size: In-memory shuffle buffer depth.
+
+    Returns:
+        A PyTorch DataLoader yielding padded batches.
+    """
+    dataset = PreTokenizedDataset(
+        paths=paths,
+        max_length=max_length,
+        shuffle_buffer_size=shuffle_buffer_size,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=(2 if num_workers > 0 else None),
+    )
+
+
+def pretokenize_dataset(
+    jsonl_paths: List[str],
+    tokenizer,
+    output_dir: str,
+    shard_size: int = 100_000,
+) -> None:
+    """Pre-tokenize JSONL files into binary ``.pt`` shards.
+
+    Reads each ``.jsonl`` file, tokenizes every document, and accumulates
+    token-ID tensors into shards of ``shard_size`` documents.  Each shard
+    is saved as a ``list[torch.Tensor]`` at
+    ``output_dir/shard_NNNNNN.pt``.
+
+    Run this once before training and point ``train_data`` at the resulting
+    shards to use :func:`make_pretokenized_dataloader`.
+
+    Args:
+        jsonl_paths: Input ``.jsonl`` file paths.
+        tokenizer: HuggingFace-compatible tokenizer with ``encode()``.
+        output_dir: Directory to write ``.pt`` shards.
+        shard_size: Documents per shard (tune to fit comfortably in RAM).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    buffer: List[torch.Tensor] = []
+    shard_idx = 0
+    total_docs = 0
+
+    for path in jsonl_paths:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                text = doc.get("text", "")
+                if not text:
+                    continue
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                if not ids:
+                    continue
+                buffer.append(torch.tensor(ids, dtype=torch.long))
+                total_docs += 1
+                if len(buffer) >= shard_size:
+                    shard_path = os.path.join(output_dir, f"shard_{shard_idx:06d}.pt")
+                    torch.save(buffer, shard_path)
+                    logger.info("Wrote shard %d (%d docs) → %s", shard_idx, len(buffer), shard_path)
+                    buffer = []
+                    shard_idx += 1
+
+    if buffer:
+        shard_path = os.path.join(output_dir, f"shard_{shard_idx:06d}.pt")
+        torch.save(buffer, shard_path)
+        logger.info("Wrote shard %d (%d docs) → %s", shard_idx, len(buffer), shard_path)
+
+    logger.info("Pre-tokenization complete: %d documents across %d shards in %s",
+                total_docs, shard_idx + (1 if buffer else 0), output_dir)
