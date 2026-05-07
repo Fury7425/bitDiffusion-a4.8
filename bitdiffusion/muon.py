@@ -58,7 +58,10 @@ def _newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch
     assert G.ndim == 2, f"Newton-Schulz expects a 2D matrix, got shape {tuple(G.shape)}"
     a, b, c = (3.4445, -4.7750, 2.0315)
 
-    X = G.to(torch.bfloat16)
+    # bf16 is fast on CUDA/XPU; on CPU bf16 matmuls are emulated in fp32
+    # and slower than running fp32 directly.
+    work_dtype = torch.bfloat16 if G.device.type in ("cuda", "xpu") else torch.float32
+    X = G.to(work_dtype)
     # Operate on the smaller dimension to keep the matmul cost down.
     transposed = X.size(0) > X.size(1)
     if transposed:

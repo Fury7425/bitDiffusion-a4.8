@@ -947,7 +947,8 @@ def main() -> None:
     parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to generate")
     parser.add_argument("--verbose", action="store_true", help="Print each denoising step")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device: auto | cuda[:<n>] | xpu[:<n>] | cpu | rocm")
 
     # Model config — must match training config
     parser.add_argument("--hidden_dim", type=int, default=768)
@@ -1020,7 +1021,8 @@ def main() -> None:
     args = parser.parse_args()
     setup_logging()
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    from .device import resolve_device
+    device = resolve_device(args.device)
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)

@@ -27,6 +27,29 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from transformers import AutoTokenizer
 
+from .device import (
+    compile_model as _compile_model,
+    configure_tf32,
+    empty_cache,
+    get_amp_settings,
+    log_device_info,
+    resolve_device,
+    seed_device,
+)
+
+
+# ---------------------------------------------------------------------------
+# GradScaler no-op — used on XPU (bf16 doesn't overflow) and CPU
+# ---------------------------------------------------------------------------
+
+class _NoOpScaler:
+    """Drop-in for GradScaler when loss scaling is not needed."""
+    def is_enabled(self) -> bool: return False
+    def scale(self, loss: torch.Tensor) -> torch.Tensor: return loss
+    def unscale_(self, optimizer) -> None: pass
+    def step(self, optimizer) -> None: optimizer.step()
+    def update(self) -> None: pass
+
 from .data import make_dataloader
 from .diffusion import CosineSchedule, MaskDiffusionLoss, ThinkingMaskSchedule, apply_mask
 from .model import BitDiffusionTransformer, ModelConfig
@@ -103,7 +126,7 @@ class TrainConfig:
     trust_checkpoint: bool = False
     wandb_project: str = "bitdiffusion-a48"
     bf16: bool = True
-    device: str = "cuda"
+    device: str = "auto"  # "auto" | "cuda[:<n>]" | "xpu[:<n>]" | "cpu" | "rocm"
 
     # Model config fields (forwarded to ModelConfig)
     # Defaults match the 1B recommended config (~30B tokens)
@@ -411,6 +434,7 @@ def validate(
     mask_token_id: int,
     device: torch.device,
     max_batches: int = 50,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ) -> float:
     """Run validation and return average loss.
 
@@ -430,6 +454,7 @@ def validate(
     model.eval()
     total_loss = 0.0
     count = 0
+    use_amp = device.type in ("cuda", "xpu")
 
     try:
         for i, batch in enumerate(val_loader):
@@ -445,7 +470,7 @@ def validate(
                 input_ids, t, mask_token_id, schedule, frozen_mask=~attention_mask
             )
 
-            with autocast("cuda", dtype=torch.bfloat16):
+            with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
                 logits, _ = model(masked_ids, t)
                 loss = loss_fn(logits, input_ids, is_masked)
 
@@ -547,13 +572,13 @@ def train(cfg: TrainConfig) -> None:
     setup_logging()
 
     # Device
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    device = resolve_device(cfg.device)
+    configure_tf32(device)   # no-op on non-CUDA; enables TF32 on Ampere+
+    log_device_info(device)
     logger.info("Using device: %s", device)
 
     # Seed
-    torch.manual_seed(cfg.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(cfg.seed)
+    seed_device(device, cfg.seed)
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_path)
@@ -621,11 +646,7 @@ def train(cfg: TrainConfig) -> None:
 
     # Optional torch.compile — large one-time cost, significant steady-state gain
     if cfg.compile_model:
-        logger.info(
-            "Compiling model with torch.compile (dynamic=True). "
-            "First step will be slow (~2-5 min) while Triton kernels are generated."
-        )
-        model = torch.compile(model, dynamic=True)
+        model = _compile_model(model, device, dynamic=True)
 
     # Data
     train_paths = sorted(glob.glob(cfg.train_data))
@@ -654,10 +675,12 @@ def train(cfg: TrainConfig) -> None:
     optimizer, lr_scheduler = _build_optimizer_and_scheduler(model, cfg)
 
     # Mixed precision
-    use_bf16 = cfg.bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
-    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
-    scaler = GradScaler("cuda", enabled=(not use_bf16 and device.type == "cuda"))
-    logger.info("Mixed precision: dtype=%s, scaler_enabled=%s", amp_dtype, scaler.is_enabled())
+    use_amp, use_bf16, amp_dtype = get_amp_settings(device, cfg.bf16)
+    # GradScaler is only useful for CUDA fp16; bf16 and non-CUDA never need it.
+    use_scaler = (not use_bf16) and device.type == "cuda"
+    scaler = GradScaler("cuda", enabled=use_scaler) if use_scaler else _NoOpScaler()
+    logger.info("Mixed precision: device=%s, dtype=%s, amp=%s, scaler=%s",
+                device.type, amp_dtype, use_amp, scaler.is_enabled())
 
     # WandB
     wandb_logger = WandBLogger(
@@ -771,7 +794,7 @@ def train(cfg: TrainConfig) -> None:
             running_masked_frac += is_masked.float().mean().item() / cfg.grad_accum_steps
 
             # Forward
-            with autocast("cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+            with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
                 logits, aux_loss = model(masked_ids, t)
                 diffusion_loss = loss_fn(logits, input_ids, is_masked, is_think=is_think)
                 # Total loss: diffusion + MoE load balance
@@ -860,7 +883,7 @@ def train(cfg: TrainConfig) -> None:
             if val_loader is not None and global_step % cfg.val_every == 0:
                 val_loss = validate(
                     model, val_loader, loss_fn, schedule, mask_token_id, device,
-                    max_batches=cfg.val_max_batches,
+                    max_batches=cfg.val_max_batches, amp_dtype=amp_dtype,
                 )
                 logger.info("step=%d  val_loss=%.4f", global_step, val_loss)
                 wandb_logger.log({"val/loss": val_loss}, step=global_step)
@@ -873,6 +896,7 @@ def train(cfg: TrainConfig) -> None:
                 logger.info("Sample generation:\n%s", sample_text)
                 wandb_logger.log({"val/sample": sample_text}, step=global_step)
 
+                empty_cache(device)
                 model.train()
 
             # --- Preemption / SIGTERM ---

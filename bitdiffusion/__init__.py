@@ -5,5 +5,10 @@
 
 from .model import BitDiffusionTransformer, ModelConfig
 from .rdt import BitRDTTransformer, RDTConfig
+from .device import resolve_device, detect_best_device
 
-__all__ = ["BitDiffusionTransformer", "ModelConfig", "BitRDTTransformer", "RDTConfig"]
+__all__ = [
+    "BitDiffusionTransformer", "ModelConfig",
+    "BitRDTTransformer", "RDTConfig",
+    "resolve_device", "detect_best_device",
+]

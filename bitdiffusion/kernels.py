@@ -676,9 +676,9 @@ def packed_ternary_linear(
 def aot_compile_check(verbose: bool = True) -> bool:
     """Best-effort syntactic check of the Triton kernel.
 
-    On a CUDA box this triggers a real Triton compile + warmup that surfaces
-    type / shape / dot-precision errors before the user runs an inference.
-    On CPU-only machines (no CUDA), it returns ``False`` and logs a warning;
+    On a CUDA or XPU box this triggers a real Triton compile + warmup that
+    surfaces type / shape / dot-precision errors before the user runs an
+    inference.  On CPU-only machines it returns ``False`` and logs a warning;
     the kernel is JIT-compiled lazily anyway so this is informational only.
 
     Returns:
@@ -688,13 +688,18 @@ def aot_compile_check(verbose: bool = True) -> bool:
         if verbose:
             logger.warning("aot_compile_check: triton is not installed; skipping")
         return False
-    if not torch.cuda.is_available():
+
+    # Pick the first available accelerator device.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif getattr(torch, "xpu", None) is not None and torch.xpu.is_available():
+        device = torch.device("xpu")
+    else:
         if verbose:
-            logger.warning("aot_compile_check: no CUDA device; cannot warm Triton kernel")
+            logger.warning("aot_compile_check: no CUDA or XPU device; cannot warm Triton kernel")
         return False
 
     try:  # pragma: no cover - GPU path
-        device = torch.device("cuda")
         M, N, K = 64, 64, 64
         x = torch.zeros(M, K, dtype=torch.int8, device=device)
         w = torch.zeros(N, K // 4, dtype=torch.uint8, device=device)
@@ -703,7 +708,7 @@ def aot_compile_check(verbose: bool = True) -> bool:
         # Use the public dispatch — this exercises the autotune+launch path.
         _ = packed_ternary_linear(x, w, scale_w, scale_x.unsqueeze(-1), N)
         if verbose:
-            logger.info("aot_compile_check: Triton kernel warm-up succeeded")
+            logger.info("aot_compile_check: Triton kernel warm-up succeeded on %s", device)
         return True
     except Exception as exc:  # pragma: no cover - GPU path
         if verbose:
