@@ -89,6 +89,9 @@ class ModelConfig:
 
     # Training efficiency
     gradient_checkpointing: bool = False
+    # Checkpoint only every Nth block (1=all, 2=every other, etc.).
+    # Higher values trade memory savings for less recompute overhead.
+    gc_every_n_layers: int = 1
 
     def __post_init__(self):
         if self.head_dim == 0:
@@ -1065,8 +1068,9 @@ class BitDiffusionTransformer(nn.Module):
 
         total_aux_loss = torch.tensor(0.0, device=x.device)
         use_ckpt = self.config.gradient_checkpointing and self.training
-        for block in self.blocks:
-            if use_ckpt:
+        gc_n = max(1, self.config.gc_every_n_layers)
+        for i, block in enumerate(self.blocks):
+            if use_ckpt and (i % gc_n == 0):
                 x, aux_loss = grad_checkpoint(
                     block, x, t_emb, kv_cache, rope_offset, use_reentrant=False,
                 )

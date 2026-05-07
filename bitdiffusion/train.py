@@ -33,9 +33,10 @@ from .model import BitDiffusionTransformer, ModelConfig
 from .muon import Muon, split_params_for_muon
 from .quantization import KVCache
 from .utils import (
-    BitStats, ExpertStats, WandBLogger, count_parameters, force_utf8_console, load_checkpoint,
-    log_expert_utilization, read_checkpoint, resolve_checkpoint_model_config,
-    save_checkpoint, setup_logging, validate_model_config_topology,
+    BitStats, ExpertStats, WandBLogger, count_parameters, drain_checkpoint_writer,
+    force_utf8_console, load_checkpoint, log_expert_utilization, read_checkpoint,
+    resolve_checkpoint_model_config, save_checkpoint, setup_logging,
+    validate_model_config_topology,
 )
 
 logger = logging.getLogger("bitdiffusion")
@@ -132,6 +133,18 @@ class TrainConfig:
 
     # Training efficiency
     gradient_checkpointing: bool = True
+    # Checkpoint every Nth block (1=all, 2=every other).  Set to 2 on
+    # memory-abundant GPUs to cut recompute overhead ~15 %.
+    gc_every_n_layers: int = 1
+    # Compile the model with torch.compile for GPU kernel fusion (~20-40 %
+    # throughput gain on Ampere/Hopper).  Adds a one-time compilation cost
+    # of ~2-5 min on first step.
+    compile_model: bool = False
+    # Offload periodic checkpoint I/O to a background thread so training
+    # resumes immediately after the state snapshot (GPU→CPU clone).
+    async_checkpoint: bool = True
+    # Maximum validation batches per evaluation run (reduce to speed up).
+    val_max_batches: int = 50
 
     # --- Muon optimizer (DeepSeek V4 style hybrid) ---
     # Muon orthogonalizes the SGD-momentum update of every 2D weight matrix
@@ -575,6 +588,7 @@ def train(cfg: TrainConfig) -> None:
         aux_loss_weight=cfg.aux_loss_weight,
         expert_capacity_factor=cfg.expert_capacity_factor,
         gradient_checkpointing=cfg.gradient_checkpointing,
+        gc_every_n_layers=cfg.gc_every_n_layers,
     )
 
     # Model
@@ -604,6 +618,14 @@ def train(cfg: TrainConfig) -> None:
         model = BitDiffusionTransformer(model_cfg).to(device)
     param_info = count_parameters(model, model_cfg)
     logger.info("Parameter breakdown: %s", param_info)
+
+    # Optional torch.compile — large one-time cost, significant steady-state gain
+    if cfg.compile_model:
+        logger.info(
+            "Compiling model with torch.compile (dynamic=True). "
+            "First step will be slow (~2-5 min) while Triton kernels are generated."
+        )
+        model = torch.compile(model, dynamic=True)
 
     # Data
     train_paths = sorted(glob.glob(cfg.train_data))
@@ -788,7 +810,7 @@ def train(cfg: TrainConfig) -> None:
                 # ablate whether degradation came from before or after the switch.
                 pre_a4_path = os.path.join(cfg.output_dir, f"step_{global_step}_pre_a4.pt")
                 save_checkpoint(pre_a4_path, model, optimizer, lr_scheduler,
-                                global_step, current_mode)
+                                global_step, current_mode, async_io=cfg.async_checkpoint)
                 logger.info("Pre-A4 ablation checkpoint saved to %s", pre_a4_path)
                 current_mode = new_mode
                 model.set_activation_mode(current_mode)
@@ -836,7 +858,10 @@ def train(cfg: TrainConfig) -> None:
 
             # --- Validation ---
             if val_loader is not None and global_step % cfg.val_every == 0:
-                val_loss = validate(model, val_loader, loss_fn, schedule, mask_token_id, device)
+                val_loss = validate(
+                    model, val_loader, loss_fn, schedule, mask_token_id, device,
+                    max_batches=cfg.val_max_batches,
+                )
                 logger.info("step=%d  val_loss=%.4f", global_step, val_loss)
                 wandb_logger.log({"val/loss": val_loss}, step=global_step)
 
@@ -852,9 +877,10 @@ def train(cfg: TrainConfig) -> None:
 
             # --- Preemption / SIGTERM ---
             if _stop_requested:
+                drain_checkpoint_writer()  # flush any pending async write first
                 ckpt_path = os.path.join(cfg.output_dir, f"step_{global_step}_preempted.pt")
                 save_checkpoint(ckpt_path, model, optimizer, lr_scheduler,
-                                global_step, current_mode)
+                                global_step, current_mode)  # always synchronous on preemption
                 logger.info("Preemption checkpoint saved to %s — exiting.", ckpt_path)
                 wandb_logger.finish()
                 return
@@ -863,9 +889,10 @@ def train(cfg: TrainConfig) -> None:
             if global_step % cfg.save_every == 0:
                 ckpt_path = os.path.join(cfg.output_dir, f"step_{global_step}.pt")
                 save_checkpoint(ckpt_path, model, optimizer, lr_scheduler,
-                                global_step, current_mode)
+                                global_step, current_mode, async_io=cfg.async_checkpoint)
 
-    # Final checkpoint
+    # Final checkpoint — drain async writer first so the file exists on exit
+    drain_checkpoint_writer()
     ckpt_path = os.path.join(cfg.output_dir, "final.pt")
     save_checkpoint(ckpt_path, model, optimizer, lr_scheduler, global_step, current_mode)
     wandb_logger.finish()
