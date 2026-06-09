@@ -50,7 +50,7 @@ class _NoOpScaler:
     def step(self, optimizer) -> None: optimizer.step()
     def update(self) -> None: pass
 
-from .data import make_dataloader
+from .data import make_dataloader, make_pretokenized_dataloader
 from .diffusion import CosineSchedule, MaskDiffusionLoss, ThinkingMaskSchedule, apply_mask
 from .model import BitDiffusionTransformer, ModelConfig
 from .muon import Muon, split_params_for_muon
@@ -117,6 +117,11 @@ class TrainConfig:
     grad_clip_norm: float = 1.0
     min_lr_ratio: float = 0.1       # cosine floor: decays to 10% of peak LR, not 0
     a4_warmup_fraction: float = 0.10
+    # Loss weighting: "mdlm" applies the continuous-time MDLM NELBO weight
+    # w(t) per masked token (better sample-efficiency); "uniform" is plain
+    # mean cross-entropy over masked positions (legacy behaviour).
+    loss_weighting: str = "mdlm"
+    loss_t_min: float = 1e-3        # clamp t away from 0 to bound the MDLM weight
     save_every: int = 2500
     val_every: int = 500
     bitstats_every: int = 250
@@ -140,6 +145,8 @@ class TrainConfig:
     t_embed_dim: int = 256
     kv_cache_bits: int = 3
     kv_cache_bos_bits: int = 4
+    # Tie input embedding and unembedding head (see ModelConfig.tie_embeddings).
+    tie_embeddings: bool = True
 
     # Thinking tokens — disabled by default for a clean baseline run.
     # Re-enable only after the base model is proven (see review notes).
@@ -472,7 +479,7 @@ def validate(
 
             with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
                 logits, _ = model(masked_ids, t)
-                loss = loss_fn(logits, input_ids, is_masked)
+                loss = loss_fn(logits, input_ids, is_masked, t=t)
 
             total_loss += loss.item()
             count += 1
@@ -563,6 +570,45 @@ def generate_sample(
 # Main training loop
 # ---------------------------------------------------------------------------
 
+def _build_dataloader(
+    paths: list[str],
+    tokenizer,
+    cfg: "TrainConfig",
+    mask_token_id: int,
+    pad_token_id: int,
+):
+    """Construct a DataLoader, auto-selecting the fast pre-tokenized path.
+
+    If every file ends in ``.pt`` the corpus is treated as pre-tokenized
+    shards (produced by ``data.pretokenize_dataset`` / ``scripts/pretokenize.py``)
+    and the tokenizer-free :func:`make_pretokenized_dataloader` is used —
+    typically 3-5x higher throughput because documents are not re-tokenized
+    every epoch. Otherwise the JSONL streaming loader is used. A mix of
+    ``.pt`` and ``.jsonl`` is rejected rather than silently mis-handled.
+    """
+    suffixes = {os.path.splitext(p)[1].lower() for p in paths}
+    if suffixes == {".pt"}:
+        logger.info("Detected pre-tokenized .pt shards (%d) — using fast loader.", len(paths))
+        return make_pretokenized_dataloader(
+            paths, cfg.max_seq_len, cfg.batch_size, cfg.num_workers,
+            pad_token_id=pad_token_id,
+        )
+    if ".pt" in suffixes and len(suffixes) > 1:
+        raise ValueError(
+            f"Mixed .pt and non-.pt files in data glob ({sorted(suffixes)}). "
+            "Point --train_data at either all-.pt pre-tokenized shards or all-.jsonl files."
+        )
+    logger.info(
+        "Using JSONL streaming loader (%d files). Tip: pre-tokenize once with "
+        "scripts/pretokenize.py and pass the .pt shards for 3-5x loader throughput.",
+        len(paths),
+    )
+    return make_dataloader(
+        paths, tokenizer, cfg.max_seq_len, cfg.batch_size, cfg.num_workers,
+        mask_token_id=mask_token_id, pad_token_id=pad_token_id,
+    )
+
+
 def train(cfg: TrainConfig) -> None:
     """Run the full training loop.
 
@@ -604,6 +650,7 @@ def train(cfg: TrainConfig) -> None:
         t_embed_dim=cfg.t_embed_dim,
         kv_cache_bits=cfg.kv_cache_bits,
         kv_cache_bos_bits=cfg.kv_cache_bos_bits,
+        tie_embeddings=cfg.tie_embeddings,
         N_think=cfg.N_think,
         think_prob=cfg.think_prob,
         use_moe=cfg.use_moe,
@@ -655,19 +702,18 @@ def train(cfg: TrainConfig) -> None:
         raise FileNotFoundError(f"No training files found matching: {cfg.train_data}")
     logger.info("Training files: %d, Validation files: %d", len(train_paths), len(val_paths))
 
-    train_loader = make_dataloader(
-        train_paths, tokenizer, cfg.max_seq_len, cfg.batch_size, cfg.num_workers,
-        mask_token_id=mask_token_id, pad_token_id=pad_token_id,
+    train_loader = _build_dataloader(
+        train_paths, tokenizer, cfg, mask_token_id, pad_token_id
     )
     val_loader = None
     if val_paths:
-        val_loader = make_dataloader(
-            val_paths, tokenizer, cfg.max_seq_len, cfg.batch_size, cfg.num_workers,
-            mask_token_id=mask_token_id, pad_token_id=pad_token_id,
+        val_loader = _build_dataloader(
+            val_paths, tokenizer, cfg, mask_token_id, pad_token_id
         )
 
     # Loss, optimizer, scheduler
-    loss_fn = MaskDiffusionLoss()
+    loss_fn = MaskDiffusionLoss(weighting=cfg.loss_weighting, t_min=cfg.loss_t_min)
+    logger.info("Loss weighting: %s (t_min=%.1e)", cfg.loss_weighting, cfg.loss_t_min)
     schedule = CosineSchedule()
     act_schedule = ActivationSchedule(cfg.max_steps, cfg.a4_warmup_fraction)
     logger.info("Activation schedule: %s", act_schedule)
@@ -796,7 +842,7 @@ def train(cfg: TrainConfig) -> None:
             # Forward
             with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
                 logits, aux_loss = model(masked_ids, t)
-                diffusion_loss = loss_fn(logits, input_ids, is_masked, is_think=is_think)
+                diffusion_loss = loss_fn(logits, input_ids, is_masked, is_think=is_think, t=t)
                 # Total loss: diffusion + MoE load balance
                 moe_loss = aux_loss * model_cfg.aux_loss_weight if model_cfg.use_moe else 0.0
                 loss = (diffusion_loss + moe_loss) / cfg.grad_accum_steps

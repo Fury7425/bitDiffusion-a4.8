@@ -149,17 +149,42 @@ class ThinkingMaskSchedule:
 class MaskDiffusionLoss(nn.Module):
     """Cross-entropy loss computed only over masked positions.
 
-    Given model logits, original tokens, and a boolean mask indicating
-    which positions were masked, computes the average cross-entropy
-    over masked positions only.
+    Two weighting modes:
+
+    - ``"uniform"`` (default): plain mean cross-entropy over masked positions.
+      Bit-identical to the original loss; ``t`` is ignored.
+    - ``"mdlm"``: the principled continuous-time MDLM NELBO weighting for the
+      cosine schedule ``alpha_bar(t)=cos(pi*t/2)``. Each sample's masked-token
+      cross-entropy is scaled by ``w(t_b)=(pi/2)*cot(pi*t_b/4) =
+      -alpha_bar'(t_b)/(1-alpha_bar(t_b))`` and reduced as a
+      per-batch-normalized token-weighted mean, so the loss scale stays
+      comparable to ``"uniform"`` (a fixed learning rate remains valid) while
+      up-weighting low-noise samples as the NELBO requires. Improves
+      sample-efficiency over the unweighted objective.
 
     Args:
         ignore_index: Token ID to ignore in loss (e.g., padding). Default -100.
+        weighting: ``"uniform"`` or ``"mdlm"``.
+        t_min: Lower clamp for ``t`` in MDLM mode — ``w(t)`` diverges as ``2/t``
+               near ``t=0``, so clamping bounds the weight (1e-3 → w ≤ ~2000).
+        normalize_per_batch: In MDLM mode, rescale weights so the batch-mean
+               weight is 1 (keeps loss magnitude comparable to uniform).
     """
 
-    def __init__(self, ignore_index: int = -100):
+    def __init__(
+        self,
+        ignore_index: int = -100,
+        weighting: str = "uniform",
+        t_min: float = 1e-3,
+        normalize_per_batch: bool = True,
+    ):
         super().__init__()
+        if weighting not in ("uniform", "mdlm"):
+            raise ValueError(f"weighting must be 'uniform' or 'mdlm', got {weighting!r}")
         self.ignore_index = ignore_index
+        self.weighting = weighting
+        self.t_min = t_min
+        self.normalize_per_batch = normalize_per_batch
 
     def forward(
         self,
@@ -167,6 +192,7 @@ class MaskDiffusionLoss(nn.Module):
         target_ids: torch.Tensor,
         is_masked: torch.Tensor,
         is_think: torch.Tensor | None = None,
+        t: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute masked diffusion loss.
 
@@ -183,26 +209,26 @@ class MaskDiffusionLoss(nn.Module):
             is_think: Optional (B, T) or (T,) bool tensor — True at
                       thinking positions. These are excluded from the
                       supervised loss.
+            t: Optional (B,) per-sample noise level in [0, 1]. Required for
+               ``"mdlm"`` weighting; ignored in ``"uniform"`` mode. If None in
+               ``"mdlm"`` mode the loss falls back to the uniform reduction.
 
         Returns:
-            Scalar loss tensor (mean cross-entropy over masked answer positions).
+            Scalar loss tensor.
         """
         B, T, V = logits.shape
 
         # Flatten for cross_entropy
-        logits_flat = logits.reshape(-1, V)  # (B*T, V)
+        logits_flat = logits.reshape(-1, V)    # (B*T, V)
         targets_flat = target_ids.reshape(-1)  # (B*T,)
-
-        # Only compute loss on masked positions
-        mask_flat = is_masked.reshape(-1)  # (B*T,)
+        mask_flat = is_masked.reshape(-1)      # (B*T,)
 
         # Exclude thinking positions from supervised loss
         if is_think is not None:
             if is_think.dim() == 1:
                 # (T,) → broadcast to (B, T)
                 is_think = is_think.unsqueeze(0).expand(B, T)
-            think_flat = is_think.reshape(-1)
-            mask_flat = mask_flat & ~think_flat
+            mask_flat = mask_flat & ~is_think.reshape(-1)
 
         # Set non-masked positions to ignore_index so they don't contribute
         targets_loss = targets_flat.clone()
@@ -214,5 +240,39 @@ class MaskDiffusionLoss(nn.Module):
         if not mask_flat.any():
             return (logits * 0).sum()  # keep grad_fn attached
 
-        loss = F.cross_entropy(logits_flat, targets_loss, ignore_index=self.ignore_index)
-        return loss
+        # --- Uniform mode: bit-identical to the original plain-mean CE. ---
+        if self.weighting == "uniform" or t is None:
+            return F.cross_entropy(
+                logits_flat, targets_loss, ignore_index=self.ignore_index
+            )
+
+        # --- MDLM continuous-time NELBO weighting. ---
+        # Per-token CE; ignore_index positions yield exactly 0, so masking and
+        # padding are already excluded from the sums below.
+        ce_flat = F.cross_entropy(
+            logits_flat, targets_loss,
+            ignore_index=self.ignore_index, reduction="none",
+        )  # (B*T,)
+        m_flat = mask_flat.to(ce_flat.dtype)  # (B*T,) 0/1
+
+        # w(t) = (pi/2) * cot(pi*t/4) = -alpha_bar'(t)/(1-alpha_bar(t)),
+        # alpha_bar(t)=cos(pi*t/2). Diverges ~2/t as t->0, so clamp t.
+        # Compute in fp32 for AMP/fp16 safety (cot is stiff near 0, and
+        # w up to ~2000 x CE can overflow fp16 accumulation).
+        tc = t.clamp(min=self.t_min).to(torch.float32)  # (B,)
+        w = (math.pi / 2.0) * torch.cos(tc * (math.pi / 4.0)) \
+            / torch.sin(tc * (math.pi / 4.0))           # (B,)
+
+        # Per-batch normalization: rescale so the batch-mean weight is 1. This
+        # keeps the loss magnitude on the same scale as the uniform plain-mean
+        # CE (so the existing fixed LR stays valid) while preserving the
+        # *relative* t-reweighting that is the content of the NELBO weight.
+        if self.normalize_per_batch:
+            w = w / w.mean().clamp_min(1e-12)
+
+        w_tok = w.to(ce_flat.dtype).unsqueeze(1).expand(B, T).reshape(-1)  # (B*T,)
+
+        # Token-weighted mean over masked positions (fp32 accumulation).
+        num = (w_tok.float() * ce_flat.float() * m_flat.float()).sum()
+        den = m_flat.float().sum().clamp_min(1.0)  # N_masked; guards all-unmasked
+        return (num / den).to(logits.dtype)

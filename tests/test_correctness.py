@@ -110,6 +110,84 @@ class TestMaskDiffusionLossZeroSupervision(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 1b. MaskDiffusionLoss — MDLM continuous-time weighting
+# ---------------------------------------------------------------------------
+
+class TestMDLMWeighting(unittest.TestCase):
+    def test_equal_t_matches_uniform(self):
+        """With per-batch normalization and a single shared t, every sample's
+        weight normalizes to 1, so the MDLM loss must equal the uniform loss."""
+        torch.manual_seed(0)
+        B, T, V = 4, 8, 32
+        logits = torch.randn(B, T, V)
+        targets = torch.randint(0, V, (B, T))
+        is_masked = torch.rand(B, T) < 0.5
+
+        uniform = MaskDiffusionLoss(weighting="uniform")
+        mdlm = MaskDiffusionLoss(weighting="mdlm", normalize_per_batch=True)
+
+        t = torch.full((B,), 0.5)
+        lu = uniform(logits, targets, is_masked)
+        lm = mdlm(logits, targets, is_masked, t=t)
+        self.assertTrue(torch.allclose(lu, lm, atol=1e-5),
+                        f"equal-t MDLM ({lm.item()}) must match uniform ({lu.item()})")
+
+    def test_none_t_falls_back_to_uniform(self):
+        """MDLM mode with t=None must reproduce the uniform loss exactly."""
+        torch.manual_seed(1)
+        B, T, V = 2, 8, 32
+        logits = torch.randn(B, T, V)
+        targets = torch.randint(0, V, (B, T))
+        is_masked = torch.ones(B, T, dtype=torch.bool)
+
+        lu = MaskDiffusionLoss(weighting="uniform")(logits, targets, is_masked)
+        lm = MaskDiffusionLoss(weighting="mdlm")(logits, targets, is_masked, t=None)
+        self.assertTrue(torch.allclose(lu, lm, atol=1e-6))
+
+    def test_mdlm_finite_positive_with_random_t(self):
+        """A real masked batch with random t must give a finite, positive loss."""
+        torch.manual_seed(2)
+        B, T, V = 3, 8, 32
+        logits = torch.randn(B, T, V)
+        targets = torch.randint(0, V, (B, T))
+        is_masked = torch.ones(B, T, dtype=torch.bool)
+        t = torch.rand(B)
+
+        loss = MaskDiffusionLoss(weighting="mdlm")(logits, targets, is_masked, t=t)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(loss.item(), 0.0)
+
+    def test_mdlm_zero_supervision_returns_zero(self):
+        """No supervised positions → finite 0 loss even in MDLM mode."""
+        B, T, V = 2, 8, 32
+        logits = torch.randn(B, T, V)
+        targets = torch.randint(0, V, (B, T))
+        is_masked = torch.zeros(B, T, dtype=torch.bool)
+        t = torch.rand(B)
+
+        loss = MaskDiffusionLoss(weighting="mdlm")(logits, targets, is_masked, t=t)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertAlmostEqual(loss.item(), 0.0, places=6)
+
+    def test_small_t_upweights_relative_to_large_t(self):
+        """A clean (small-t) sample's masked tokens must carry more weight than
+        a noisy (large-t) sample's when their per-token CE is identical."""
+        B, T, V = 2, 4, 8
+        # Identical logits/targets for both samples so per-token CE matches.
+        logits = torch.randn(1, T, V).repeat(B, 1, 1)
+        targets = torch.randint(0, V, (1, T)).repeat(B, 1)
+        is_masked = torch.ones(B, T, dtype=torch.bool)
+
+        # Without per-batch normalization the absolute weights are visible.
+        loss_fn = MaskDiffusionLoss(weighting="mdlm", normalize_per_batch=False)
+        t = torch.tensor([0.05, 0.95])  # sample 0 clean, sample 1 noisy
+        loss = loss_fn(logits, targets, is_masked, t=t)
+        # w(0.05) >> w(0.95): weighted mean must exceed the unweighted CE mean.
+        unweighted = MaskDiffusionLoss(weighting="uniform")(logits, targets, is_masked)
+        self.assertGreater(loss.item(), unweighted.item())
+
+
+# ---------------------------------------------------------------------------
 # 2. generate_sample — must not sample special-token IDs
 # ---------------------------------------------------------------------------
 

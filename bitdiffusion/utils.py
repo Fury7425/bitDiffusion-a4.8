@@ -36,6 +36,7 @@ _MODEL_TOPOLOGY_FIELDS = (
     "max_seq_len",
     "mask_token_id",
     "t_embed_dim",
+    "tie_embeddings",
     "N_think",
     "think_token_id",
     "use_moe",

@@ -71,6 +71,13 @@ class ModelConfig:
     kv_cache_bits: int = 3
     kv_cache_bos_bits: int = 4
 
+    # Tie the input embedding and the unembedding (output) head so they share
+    # one weight tensor. With a 152K vocab the two tables are ~37% of all
+    # parameters; tying drops ~vocab_size*hidden_dim params, halves the
+    # optimizer state for the head, shrinks checkpoints, and usually improves
+    # small-model quality. Default on. Set False to keep separate matrices.
+    tie_embeddings: bool = True
+
     # --- Thinking tokens ---
     think_token_id: int = 0   # set automatically in __post_init__ if 0
     N_think: int = 64         # number of thinking token positions (0 = disabled)
@@ -988,6 +995,13 @@ class BitDiffusionTransformer(nn.Module):
 
         self.apply(self._init_weights)
         self._scale_residual_init(config.n_layers)
+
+        # Tie input embedding and unembedding head into one shared weight.
+        # Done after init so the shared tensor carries the embedding's init.
+        # state_dict still emits both `embed.weight` and `unembed.weight`
+        # (pointing at the same tensor), so checkpoint round-trips are unchanged.
+        if config.tie_embeddings:
+            self.unembed.weight = self.embed.weight
 
     def _scale_residual_init(self, n_residual_blocks: int) -> None:
         """Apply GPT-2-style scaled init to residual output projections.

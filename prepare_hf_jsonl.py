@@ -9,6 +9,11 @@ OUTPUT FORMAT  (matches StreamingJsonlDataset in data.py — do NOT change)
 
 RECOMMENDED TRAINING CONFIGS
 ──────────────────────────────────────────────────────────────────
+NOTE: train.py ships the canonical defaults (seq_len=4096, batch_size=8,
+grad_accum=16, max_steps=57_500, lr=2e-4, warmup=4000) — also ~30.1B tokens.
+The configs below are equivalent alternatives (same token budget, different
+seq_len/batch trade-offs), not a second source of truth.
+
 1B MODEL  (~30B tokens — 30 tokens/param, uses full data mix)
   hidden_dim=2048  n_layers=16  n_heads=16  head_dim=128
   ffn_dim=8192     seq_len=2048  batch_size=16  grad_accum=8
@@ -78,18 +83,18 @@ SHUFFLE_BUCKET = 500_000 # lines held in memory during streaming shuffle
 
 # Variable sequence length distribution.
 # Teaches the model to handle short AND long contexts rather than always
-# seeing full 8192-token sequences. Weighted toward longer sequences so
+# seeing full 4096-token sequences. Weighted toward longer sequences so
 # the model gets good long-context training, but sees enough short ones
 # to handle "hi → hi, how are you?" style responses cleanly.
+# 4096 is the hard cap (matches model max_seq_len); no 8192 bucket.
 #
-# Distribution rationale:
+# Distribution rationale (weights below sum to 100):
 #   128  —  5%  short conversational turns, single sentences
 #   256  —  8%  short paragraphs, brief answers
-#   512  — 10%  multi-sentence answers, small code snippets
+#   512  — 10%  multi-sentence answers, short excerpts
 #  1024  — 15%  full paragraphs, short articles
 #  2048  — 20%  multi-paragraph, standard doc length
-#  4096  — 22%  long articles, reasoning chains
-#  8192  — 20%  full ARC grids, long documents, deep reasoning
+#  4096  — 42%  long articles, reasoning chains, deep context
 #
 # Format: (seq_len, relative_weight)
 SEQ_LENGTH_DIST = [

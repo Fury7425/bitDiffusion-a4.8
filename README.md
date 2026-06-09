@@ -1,6 +1,6 @@
 # BitDiffusion a4.8
 
-A 1.7B parameter masked diffusion language model combining Microsoft's BitNet a4.8
+A 1.4B parameter (weight-tied; 1.71B untied) masked diffusion language model combining Microsoft's BitNet a4.8
 quantization (ternary weights + hybrid 4-bit/8-bit activations) with an MDLM-style
 absorbing-state diffusion objective, quantized KV cache, and latent scratchpad thinking tokens.
 
@@ -126,9 +126,10 @@ model.eval().pack_for_inference()  # one-time, before sampling
 
 | Hyperparameter | Value |
 |---|---|
-| Parameters (total) | 1.705B |
+| Parameters (total) | ~1.39B tied · 1.71B untied |
 | Parameters (ternary) | 1.074B |
-| Parameters (full precision) | 0.631B |
+| Parameters (full precision) | ~0.32B tied · 0.631B untied |
+| Embeddings | Tied input = output by default (`--tie_embeddings False` to untie) |
 | Hidden dimension | 2,048 |
 | Layers | 16 |
 | Attention heads | 16 |
@@ -136,7 +137,7 @@ model.eval().pack_for_inference()  # one-time, before sampling
 | FFN dimension | 8,192 |
 | Vocabulary size | 152,064 (Qwen tokenizer) |
 | Context window | 4,096 tokens |
-| Thinking tokens | 64 |
+| Thinking tokens | 64 capacity (disabled by default; `--N_think 64` to enable) |
 | KV cache bits | 3 (BOS: 4) |
 
 ### Default model: BitRDTTransformer (Recurrent-Depth Transformer)
@@ -164,7 +165,7 @@ formats are auto-detected by `sample.py` and `export.py`.
 
 ### 1. Prepare data
 
-Download and preprocess the ~40B token training mix:
+Download and preprocess the ~20B token training mix:
 
 ```bash
 export HF_TOKEN=hf_your_token_here
@@ -174,19 +175,17 @@ python prepare_hf_jsonl.py
 Produces `data/train/hf_mix_train.jsonl` and `data/val/hf_mix_val.jsonl`.
 Progress is checkpointed to `data/hf_shards/progress.json` — safe to interrupt and resume.
 
-**Dataset mix (~40B tokens):**
+**Dataset mix (~20B tokens, English-only — matches `prepare_hf_jsonl.py`):**
 
 | Dataset | Source | Tokens |
 |---|---|---|
-| FineWeb-Edu | HuggingFaceFW/fineweb-edu (sample-100BT) | 15B |
-| DCLM | HuggingFaceFW/dclm_100BT | 8B |
-| OpenWebMath | open-web-math/open-web-math | 7B |
-| Cosmopedia | HuggingFaceTB/cosmopedia | 4B |
-| Wikipedia (EN) | wikimedia/wikipedia 20231101.en | 2B |
-| FinePDFs | HuggingFaceFW/finepdfs_100BT | 2B |
-| MathCode-Pile | MathGenie/MathCode-Pile | 2B |
-| StarCoder Python | bigcode/starcoderdata (python) | 2B |
-| StarCoder JS | bigcode/starcoderdata (javascript) | 1B |
+| FineWeb-Edu | HuggingFaceFW/fineweb-edu (sample-100BT) | 8B |
+| DCLM | HuggingFaceFW/dclm_100BT | 4B |
+| OpenWebMath | open-web-math/open-web-math | 3B |
+| Cosmopedia | HuggingFaceTB/cosmopedia (web_samples_v1) | 2B |
+| Wikipedia (EN) | wikimedia/wikipedia 20231101.en | 1B |
+| FinePDFs | HuggingFaceFW/finepdfs_100BT | 1B |
+| MathCode-Pile | MathGenie/MathCode-Pile | 1B |
 
 Chunks are sampled from a weighted sequence-length distribution
 `{128: 5%, 256: 8%, 512: 10%, 1024: 15%, 2048: 20%, 4096: 42%}` so the model
@@ -201,7 +200,18 @@ wandb login   # optional
 python train.py
 ```
 
-Runs 57,500 steps × (8 batch × 16 grad accum × 4,096 seq) = **30.1B tokens**.
+Runs 57,500 steps × (8 batch × 16 grad accum × 4,096 seq) = **30.1B training tokens**
+— roughly 1.5 epochs over the ~20B-token corpus above.
+
+**Faster data loading (optional but recommended).** The JSONL loader re-tokenizes
+every document every epoch. Pre-tokenize once into `.pt` shards and point
+`--train_data` at them — `train.py` auto-detects the shards and uses the
+tokenizer-free fast loader (3–5× higher loader throughput, less GPU starvation):
+
+```bash
+python scripts/pretokenize.py --jsonl "data/train/*.jsonl" --output_dir data/train_pt
+python train.py --train_data "data/train_pt/*.pt"
+```
 
 > Training stays on the float-sim path. **Never call
 > `pack_for_inference()` during training** — packed BitLinears are not
@@ -244,6 +254,8 @@ python train.py \
 | Mixed precision | bf16 | |
 | Gradient checkpointing | Yes | ~29.5 GB on A100 40GB |
 | A4 warmup fraction | 0.10 | Last 10% of steps in A4 mode |
+| Loss weighting | MDLM NELBO | `w(t)=(π/2)·cot(πt/4)`; `--loss_weighting uniform` for legacy plain-mean CE |
+| Embedding tying | On | Input/output embeddings share one weight; `--tie_embeddings False` to untie |
 
 ### Two-Stage Activation Schedule
 
@@ -506,7 +518,7 @@ export.py             # CLI entry point for bitdiffusion.export
 
 ## Scaling
 
-This repo trains a 1.7B model on a single A100 40GB for ~$200. To scale:
+This repo trains a 1.4B model on a single A100 40GB for ~$200. To scale:
 
 | Target | Change |
 |---|---|
@@ -603,5 +615,9 @@ sequence length — compute, not VRAM, is the bottleneck at long context.
 - **Model weights:** BigCode OpenRAIL-M v1.0 (use restrictions apply — see [LICENSE](LICENSE))
 - **Source code:** Apache 2.0
 - **Training data:** Mixed licenses — see individual dataset cards.
-  StarCoderData (BigCode OpenRAIL-M) is the most restrictive source in the mix,
-  which is why model weights carry the OpenRAIL-M terms.
+
+> **Note:** earlier revisions justified the OpenRAIL-M weights license by the
+> inclusion of StarCoderData. The shipped `prepare_hf_jsonl.py` pipeline is now
+> English-only and does **not** include StarCoderData (see Dataset mix above).
+> Re-confirm the appropriate weights license against the datasets you actually
+> train on before redistributing.

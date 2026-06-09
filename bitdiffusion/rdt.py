@@ -483,6 +483,12 @@ class BitRDTTransformer(nn.Module):
         n_residual = config.prelude_layers + config.recurrent_layers + config.coda_layers
         self._scale_residual_init(n_residual)
 
+        # Tie input embedding and unembedding head (see ModelConfig.tie_embeddings).
+        # Both `embed.weight` and `unembed.weight` keys are still serialized,
+        # pointing at one shared tensor, so checkpoint round-trips are unchanged.
+        if config.tie_embeddings:
+            self.unembed.weight = self.embed.weight
+
     def _scale_residual_init(self, n_residual_blocks: int) -> None:
         """GPT-2-style scaled init for residual output projections."""
         scale = 1.0 / math.sqrt(max(2 * n_residual_blocks, 1))
