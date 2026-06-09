@@ -50,7 +50,7 @@ class _NoOpScaler:
     def step(self, optimizer) -> None: optimizer.step()
     def update(self) -> None: pass
 
-from .data import make_dataloader, make_pretokenized_dataloader
+from .data import make_dataloader, make_litdata_dataloader, make_pretokenized_dataloader
 from .diffusion import CosineSchedule, MaskDiffusionLoss, ThinkingMaskSchedule, apply_mask
 from .model import BitDiffusionTransformer, ModelConfig
 from .muon import Muon, split_params_for_muon
@@ -61,6 +61,19 @@ from .utils import (
     resolve_checkpoint_model_config, save_checkpoint, setup_logging,
     validate_model_config_topology,
 )
+
+# Optional: bitsandbytes 8-bit AdamW (block-wise 8-bit optimizer state).
+# Cuts AdamW optimizer-state memory ~4x (fp32 m+v = 8 bytes/param -> ~2 bytes/
+# param) for the embedding / unembedding-head / RMSNorm group, freeing VRAM for
+# a larger batch. The Muon group (2D transformer-body matrices) is untouched and
+# keeps its single fp32 momentum buffer. Falls back to fp32 torch.optim.AdamW
+# when not installed — `pip install bitsandbytes` (CUDA) to enable.
+try:
+    import bitsandbytes as bnb  # type: ignore
+    _HAS_BNB = True
+except Exception:  # noqa: BLE001 - optional dependency, absent by default
+    bnb = None  # type: ignore[assignment]
+    _HAS_BNB = False
 
 logger = logging.getLogger("bitdiffusion")
 
@@ -126,6 +139,11 @@ class TrainConfig:
     val_every: int = 500
     bitstats_every: int = 250
     num_workers: int = 4
+    # Read training data from a litdata-optimized directory (resumable
+    # mid-epoch, deterministic shuffle, balanced shards). When True,
+    # --train_data / --val_data are treated as litdata dataset directories
+    # produced by scripts/optimize_litdata.py, not .jsonl / .pt globs.
+    use_litdata: bool = False
     seed: int = 42
     resume_from: str = ""
     trust_checkpoint: bool = False
@@ -187,6 +205,13 @@ class TrainConfig:
     muon_nesterov: bool = True
     muon_ns_steps: int = 5
     muon_weight_decay: float = 0.0
+
+    # Use bitsandbytes 8-bit AdamW for the AdamW parameter group (embeddings,
+    # unembedding head, RMSNorm gains, biases). ~4x smaller optimizer state on
+    # that group -> frees VRAM for a larger batch. Muon group is unaffected.
+    # Requires `pip install bitsandbytes` (CUDA); no-op fallback to fp32 AdamW
+    # if the library is absent.
+    use_8bit_adam: bool = False
 
     # --- Recurrent-Depth Transformer (OpenMythos integration) ---
     # RDT is the default model. Set model_type="standard" to train the flat
@@ -356,6 +381,31 @@ class _HybridScheduler:
         raise ValueError("Unrecognized scheduler state_dict format")
 
 
+def _make_adamw(params, cfg: "TrainConfig") -> torch.optim.Optimizer:
+    """Build the AdamW-group optimizer.
+
+    Returns bitsandbytes' block-wise 8-bit ``AdamW8bit`` when
+    ``cfg.use_8bit_adam`` is set and the library imports, otherwise the stdlib
+    ``torch.optim.AdamW``. Only the AdamW parameter group (embeddings,
+    unembedding head, RMSNorm gains, biases) is affected — the Muon group is
+    built separately and keeps full-precision momentum. Same hyperparameters
+    either way, so checkpoints and LR schedules are unchanged.
+    """
+    if cfg.use_8bit_adam:
+        if _HAS_BNB:
+            logger.info("AdamW group: bitsandbytes AdamW8bit (8-bit optimizer state).")
+            return bnb.optim.AdamW8bit(
+                params, lr=cfg.lr, betas=(0.9, 0.95), weight_decay=cfg.weight_decay,
+            )
+        logger.warning(
+            "use_8bit_adam=True but bitsandbytes is not installed; using fp32 "
+            "torch.optim.AdamW. `pip install bitsandbytes` (CUDA) to enable."
+        )
+    return torch.optim.AdamW(
+        params, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+    )
+
+
 def _build_optimizer_and_scheduler(
     model: nn.Module, cfg: "TrainConfig"
 ) -> tuple[_HybridOptimizer, _HybridScheduler]:
@@ -380,19 +430,13 @@ def _build_optimizer_and_scheduler(
             logger.warning(
                 "Muon enabled but no 2D matrix parameters were found; falling back to AdamW only."
             )
-            adamw_opt = torch.optim.AdamW(
-                model.parameters(), lr=cfg.lr,
-                weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
-            )
+            adamw_opt = _make_adamw(model.parameters(), cfg)
             return (
                 _HybridOptimizer(adamw_opt),
                 _HybridScheduler(torch.optim.lr_scheduler.LambdaLR(adamw_opt, lr_lambda)),
             )
 
-        adamw_opt = torch.optim.AdamW(
-            adamw_params, lr=cfg.lr,
-            weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
-        )
+        adamw_opt = _make_adamw(adamw_params, cfg)
         muon_opt = Muon(
             muon_params,
             lr=cfg.muon_lr,
@@ -417,10 +461,7 @@ def _build_optimizer_and_scheduler(
             ),
         )
 
-    adamw_opt = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr,
-        weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
-    )
+    adamw_opt = _make_adamw(model.parameters(), cfg)
     logger.info("Optimizer: AdamW (lr=%.2e, weight_decay=%.3f)", cfg.lr, cfg.weight_decay)
     return (
         _HybridOptimizer(adamw_opt),
@@ -585,7 +626,19 @@ def _build_dataloader(
     typically 3-5x higher throughput because documents are not re-tokenized
     every epoch. Otherwise the JSONL streaming loader is used. A mix of
     ``.pt`` and ``.jsonl`` is rejected rather than silently mis-handled.
+
+    When ``cfg.use_litdata`` is set, ``paths`` is treated as a single
+    litdata-optimized dataset directory and the resumable streaming loader is
+    used instead.
     """
+    if cfg.use_litdata:
+        input_dir = paths[0]
+        logger.info("Using litdata StreamingDataset (%s) — resumable, sharded.", input_dir)
+        return make_litdata_dataloader(
+            input_dir, cfg.max_seq_len, cfg.batch_size, cfg.num_workers,
+            pad_token_id=pad_token_id, shuffle=True,
+        )
+
     suffixes = {os.path.splitext(p)[1].lower() for p in paths}
     if suffixes == {".pt"}:
         logger.info("Detected pre-tokenized .pt shards (%d) — using fast loader.", len(paths))

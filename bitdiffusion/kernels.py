@@ -37,6 +37,21 @@ except Exception:  # noqa: BLE001 - triton import failures are intentionally swa
     tl = None  # type: ignore[assignment]
     _HAS_TRITON = False
 
+# Optional: Microsoft T-MAC low-bit lookup-table mpGEMM for CPU inference.
+# T-MAC replaces the multiply-accumulate of low-bit x int8 GEMM with table
+# lookups, giving a large CPU throughput win over the torch._int_mm fallback for
+# packed-ternary weights. The public T-MAC distribution is primarily a TVM-based
+# codegen toolchain rather than a stable runtime GEMM call, so rather than assume
+# a symbol exists we probe for a callable ternary-GEMM entrypoint at import time
+# and fall back to torch when it is absent (the common case for a codegen-only
+# install). `pip install t-mac` + a built runtime to enable.
+try:  # pragma: no cover - optional, absent by default
+    import tmac as _tmac  # type: ignore
+    _HAS_TMAC = True
+except Exception:  # noqa: BLE001 - optional dependency
+    _tmac = None  # type: ignore[assignment]
+    _HAS_TMAC = False
+
 
 __all__ = [
     "pack_ternary_2bit",
@@ -599,6 +614,81 @@ def _torch_packed_linear(
 
 
 # ---------------------------------------------------------------------------
+# T-MAC CPU lookup-table backend (optional)
+# ---------------------------------------------------------------------------
+
+def _tmac_ternary_gemm_fn():
+    """Return a callable T-MAC ternary mpGEMM entrypoint, or ``None``.
+
+    The exact runtime symbol differs across T-MAC versions (and a codegen-only
+    install exposes none); we try the known names and return the first callable.
+    Returning ``None`` makes the caller fall back to the torch INT8 path.
+    """
+    if not _HAS_TMAC:
+        return None
+    candidates = ("qgemm_lut", "ternary_gemm", "mpgemm", "gemm_lut")
+    for attr in candidates:
+        fn = getattr(_tmac, attr, None)
+        if callable(fn):
+            return fn
+    runtime = getattr(_tmac, "runtime", None)
+    if runtime is not None:
+        for attr in candidates:
+            fn = getattr(runtime, attr, None)
+            if callable(fn):
+                return fn
+    return None
+
+
+_TMAC_GEMM = _tmac_ternary_gemm_fn()
+
+
+def _tmac_packed_linear(
+    x_int: torch.Tensor,
+    w_packed: torch.Tensor,
+    scale_w: torch.Tensor,
+    scale_x: torch.Tensor,
+    out_features: int,
+) -> torch.Tensor:
+    """CPU packed-ternary linear via T-MAC LUT mpGEMM.
+
+    Mirrors :func:`_torch_packed_linear`'s contract — returns float32
+    ``(x_int @ unpack(w).T) * scale_w / scale_x``. T-MAC consumes the 2-bit
+    packed weight directly (it owns the LUT layout). Raises if the entrypoint is
+    missing or rejects the inputs so the caller can fall back to torch.
+    """
+    fn = _TMAC_GEMM
+    if fn is None:
+        raise RuntimeError("no T-MAC runtime ternary-GEMM entrypoint available")
+    M = x_int.shape[0]
+    acc = fn(x_int.contiguous(), w_packed.contiguous(), int(out_features))
+    acc = torch.as_tensor(acc, dtype=torch.float32, device=x_int.device).reshape(M, out_features)
+    scale_x_col = scale_x.reshape(M, 1).to(torch.float32)
+    scale_w_f = scale_w.to(torch.float32) if isinstance(scale_w, torch.Tensor) else float(scale_w)
+    return acc * (scale_w_f / scale_x_col)
+
+
+def _cpu_packed_linear(
+    x_int: torch.Tensor,
+    w_packed: torch.Tensor,
+    scale_w: torch.Tensor,
+    scale_x: torch.Tensor,
+    out_features: int,
+) -> torch.Tensor:
+    """CPU packed-ternary dispatch: T-MAC LUT mpGEMM when available, else torch.
+
+    Only attempts T-MAC for CPU tensors; on any other device, or if the T-MAC
+    kernel errors, falls through to the correctness-guaranteed torch INT8 path.
+    """
+    if _TMAC_GEMM is not None and x_int.device.type == "cpu":
+        try:  # pragma: no cover - depends on a built T-MAC runtime
+            return _tmac_packed_linear(x_int, w_packed, scale_w, scale_x, out_features)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("T-MAC GEMM failed (%s); falling back to torch INT8.", exc)
+    return _torch_packed_linear(x_int, w_packed, scale_w, scale_x, out_features)
+
+
+# ---------------------------------------------------------------------------
 # Public dispatch
 # ---------------------------------------------------------------------------
 
@@ -658,11 +748,11 @@ def packed_ternary_linear(
             )
         except Exception as exc:  # pragma: no cover - GPU path
             logger.warning("Triton packed-ternary kernel failed (%s); falling back to torch", exc)
-            out = _torch_packed_linear(x_flat, w_packed, scale_w_t, scale_x_flat, out_features)
+            out = _cpu_packed_linear(x_flat, w_packed, scale_w_t, scale_x_flat, out_features)
             if out.dtype != out_dtype:
                 out = out.to(out_dtype)
     else:
-        out = _torch_packed_linear(x_flat, w_packed, scale_w_t, scale_x_flat, out_features)
+        out = _cpu_packed_linear(x_flat, w_packed, scale_w_t, scale_x_flat, out_features)
         if out.dtype != out_dtype:
             out = out.to(out_dtype)
 

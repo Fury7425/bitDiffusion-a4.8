@@ -27,6 +27,18 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 logger = logging.getLogger("bitdiffusion")
 
+# Optional: litdata streaming dataset. Resumable mid-epoch (exact sample-level
+# resume on preemption), deterministic shuffling, balanced shards, optional
+# cloud streaming. Used when a litdata-optimized directory is passed instead of
+# the hand-rolled JSONL / .pt loaders. Falls back/raises clearly if absent —
+# `pip install litdata` to enable.
+try:
+    import litdata as _litdata  # type: ignore
+    _HAS_LITDATA = True
+except Exception:  # noqa: BLE001 - optional dependency, absent by default
+    _litdata = None  # type: ignore[assignment]
+    _HAS_LITDATA = False
+
 
 class StreamingJsonlDataset(IterableDataset):
     """Lazily streams examples from one or more ``.jsonl`` files.
@@ -375,3 +387,121 @@ def pretokenize_dataset(
 
     logger.info("Pre-tokenization complete: %d documents across %d shards in %s",
                 total_docs, shard_idx + (1 if buffer else 0), output_dir)
+
+
+# ---------------------------------------------------------------------------
+# litdata streaming path (optional — resumable, sharded, cloud-streamable)
+# ---------------------------------------------------------------------------
+
+def _tokenize_for_litdata(item) -> Iterator[Dict[str, torch.Tensor]]:
+    """``litdata.optimize`` worker fn: yield ``{"input_ids": LongTensor}`` chunks
+    for every document in one JSONL file.
+
+    Top-level (picklable) so it survives multiprocessing in ``optimize``. Mirrors
+    ``StreamingJsonlDataset._produce_chunks``: documents longer than
+    ``max_length`` are split into non-overlapping chunks; no tokens cross a
+    document boundary; chunks shorter than ``min_chunk_size`` are dropped.
+
+    Args:
+        item: Tuple ``(path, tokenizer, max_length, min_chunk_size)``.
+    """
+    path, tokenizer, max_length, min_chunk_size = item
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = doc.get("text", "")
+            if not text:
+                continue
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if not ids:
+                continue
+            for start in range(0, len(ids), max_length):
+                chunk = ids[start : start + max_length]
+                if len(chunk) >= min_chunk_size:
+                    yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
+
+
+def optimize_to_litdata(
+    jsonl_paths: List[str],
+    tokenizer,
+    output_dir: str,
+    max_length: int = 4096,
+    min_chunk_size: int = 16,
+    num_workers: int = 4,
+    chunk_bytes: str = "64MB",
+) -> None:
+    """Tokenize JSONL files into a litdata-optimized dataset directory.
+
+    Run once before training; point ``--train_data`` at ``output_dir`` and set
+    ``--use_litdata True``. Each stored item is ``{"input_ids": LongTensor}``,
+    already chunked to ``max_length`` so the training loader reads items
+    directly with no re-splitting.
+
+    Args:
+        jsonl_paths: Input ``.jsonl`` file paths.
+        tokenizer: HuggingFace-compatible tokenizer with ``encode()``.
+        output_dir: Destination directory for the optimized binary chunks.
+        max_length: Maximum sequence length per stored chunk.
+        min_chunk_size: Minimum chunk length; shorter chunks are discarded.
+        num_workers: Parallel optimize workers.
+        chunk_bytes: Target size of each litdata binary chunk.
+    """
+    if not _HAS_LITDATA:
+        raise RuntimeError("litdata is not installed. `pip install litdata` to use the litdata path.")
+    inputs = [(p, tokenizer, max_length, min_chunk_size) for p in sorted(jsonl_paths)]
+    _litdata.optimize(
+        fn=_tokenize_for_litdata,
+        inputs=inputs,
+        output_dir=output_dir,
+        chunk_bytes=chunk_bytes,
+        num_workers=num_workers,
+    )
+    logger.info("litdata optimize complete: %d source files -> %s", len(inputs), output_dir)
+
+
+def make_litdata_dataloader(
+    input_dir: str,
+    max_length: int = 4096,
+    batch_size: int = 8,
+    num_workers: int = 4,
+    pad_token_id: int = 0,
+    shuffle: bool = True,
+    drop_last: bool = True,
+):
+    """Create a resumable streaming DataLoader from a litdata dataset directory.
+
+    The directory must have been produced by :func:`optimize_to_litdata` (or any
+    litdata ``optimize`` run yielding ``{"input_ids": LongTensor}`` items already
+    chunked to ``<= max_length``). Items are collated with the same
+    :func:`collate_fn` used by the other loaders, so batches are drop-in
+    identical (padded ``input_ids`` + bool ``attention_mask``).
+
+    Args:
+        input_dir: litdata-optimized dataset directory (local path or cloud URI).
+        max_length: Maximum sequence length (informational; items are
+            pre-chunked at optimize time).
+        batch_size: Batch size.
+        num_workers: DataLoader worker count.
+        pad_token_id: Padding token ID.
+        shuffle: Shuffle items each epoch (deterministic, resumable).
+        drop_last: Drop the final ragged batch.
+
+    Returns:
+        A ``litdata.StreamingDataLoader`` yielding padded batches.
+    """
+    if not _HAS_LITDATA:
+        raise RuntimeError("litdata is not installed. `pip install litdata` to use the litdata path.")
+    dataset = _litdata.StreamingDataset(input_dir, shuffle=shuffle, drop_last=drop_last, max_cache_size="50GB")
+    return _litdata.StreamingDataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
+        pin_memory=True,
+    )
