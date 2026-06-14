@@ -226,6 +226,14 @@ def resolve_checkpoint_model_config(
         config_data = dict(model_config)
         if moe_layers_override:
             config_data["moe_layers"] = moe_layers_override
+        # The checkpoint's model_config may be a superset of ModelConfig — e.g.
+        # an RDTConfig (subclass) that adds prelude/recurrent/coda fields. Filter
+        # to ModelConfig's own fields so construction does not choke on the
+        # extras; the RDT path reconstructs the full RDTConfig from the separate
+        # "rdt_config" key. Also forward-compatible with future config fields.
+        from dataclasses import fields as _dc_fields
+        _known = {f.name for f in _dc_fields(ModelConfig)}
+        config_data = {k: v for k, v in config_data.items() if k in _known}
         return ModelConfig(**config_data), True
 
     if fallback_factory is None:

@@ -734,6 +734,10 @@ def train(cfg: TrainConfig) -> None:
         )
         rdt_cfg = RDTConfig(**base)
         model = BitRDTTransformer(rdt_cfg).to(device)
+        # Keep the plain model_cfg in sync so resume topology validation
+        # (which compares use_rdt) matches RDT checkpoints instead of always
+        # mismatching requested=False vs checkpoint=True.
+        model_cfg.use_rdt = True
         logger.info(
             "BitRDTTransformer: prelude=%d, recurrent=%d, coda=%d, max_loops=%d",
             cfg.rdt_prelude_layers, cfg.rdt_recurrent_layers,
