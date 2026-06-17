@@ -22,7 +22,8 @@ def mk(name, sc):
         return BitRDTTransformer(RDTConfig(
             vocab_size=V, hidden_dim=32, n_heads=2, ffn_dim=64, max_seq_len=32,
             mask_token_id=V, use_rdt=True, use_self_cond=sc,
-            prelude_layers=1, recurrent_layers=1, coda_layers=1, max_loop_iters=2))
+            prelude_layers=1, recurrent_layers=1, coda_layers=1, max_loop_iters=2,
+            loop_dim=16))
     return BitDiffusionTransformer(ModelConfig(
         vocab_size=V, hidden_dim=32, n_layers=2, n_heads=2, ffn_dim=64,
         max_seq_len=32, mask_token_id=V, use_self_cond=sc))
