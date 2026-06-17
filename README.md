@@ -573,22 +573,30 @@ for the same quality, so treat token counts as a floor.
 
 ### Training cost
 
-| Model | Type | Active params | Train tokens | Compute (EFLOP) | GPU-hours (H100) | Est. cost |
-|---|---|---|---|---|---|---|
-| 500M | dense | 0.5B | 10B | 30 | ~20 | **~$40** |
-| 750M | dense | 0.75B | 15B | 68 | ~50 | **~$95** |
-| 1B | dense | 1B | 20B | 120 | ~85 | **~$170** |
-| 3B | dense | 3B | 60B | 1,080 | ~760 | **~$1.5K** |
-| 5B | dense | 5B | 100B | 3,000 | ~2,100 | **~$4.2K** |
-| 7B | dense | 7B | 140B | 5,880 | ~4,100 | **~$8.2K** |
-| 12B | dense | 12B | 240B | 17,280 | ~12,100 | **~$24K** |
-| 32B | MoE (8e/top-2, ~8B act) | 8B | 300B | 14,400 | ~10,100 | **~$20K** |
-| 70B | MoE (~12B act) | 12B | 500B | 36,000 | ~25,300 | **~$51K** |
-| 500B | MoE (~30B act) | 30B | 3T | 540,000 | ~379K | **~$760K** |
-| 1T | MoE (~50B act) | 50B | 6T | 1,800,000 | ~1.26M | **~$2.5M** |
+| Model | Type | Active params | Train tokens | Compute (EFLOP) | GPU-hours (H100) | Est. cost | Good max ctx |
+|---|---|---|---|---|---|---|---|
+| 500M | dense | 0.5B | 10B | 30 | ~20 | **~$40** | 4K |
+| 750M | dense | 0.75B | 15B | 68 | ~50 | **~$95** | 8K |
+| 1B | dense | 1B | 20B | 120 | ~85 | **~$170** | 8K |
+| 3B | dense | 3B | 60B | 1,080 | ~760 | **~$1.5K** | 16K |
+| 5B | dense | 5B | 100B | 3,000 | ~2,100 | **~$4.2K** | 32K |
+| 7B | dense | 7B | 140B | 5,880 | ~4,100 | **~$8.2K** | 32K |
+| 12B | dense | 12B | 240B | 17,280 | ~12,100 | **~$24K** | 64K |
+| 32B | MoE (8e/top-2, ~8B act) | 8B | 300B | 14,400 | ~10,100 | **~$20K** | 128K |
+| 70B | MoE (~12B act) | 12B | 500B | 36,000 | ~25,300 | **~$51K** | 256K |
+| 500B | MoE (~30B act) | 30B | 3T | 540,000 | ~379K | **~$760K** | 512K |
+| 1T | MoE (~50B act) | 50B | 6T | 1,800,000 | ~1.26M | **~$2.5M** | 1M |
 
 Wall-clock on a 1,024×H100 cluster: 12B ≈ 12h, 70B ≈ 1 day, 500B ≈ 2.2 weeks,
 1T ≈ 7+ weeks.
+
+**Good max ctx** is theorized, not trained — the reference run tops out at the 4K
+training window. It assumes a long-context fine-tuning phase (RoPE extension + a
+length-annealed data mix) and scales with capability rather than cost: bigger models
+hold longer dependencies, and the 3-bit KV cache keeps the memory linear in `seq`
+cheap (~`n_layers · 2 · n_kv_heads · head_dim · seq · 3/8` bytes), so context is
+bounded by training effort, not inference VRAM. Treat these as targets to validate,
+not guarantees.
 
 ### Inference footprint (packed 2-bit ternary, target ≥20 tok/s)
 
