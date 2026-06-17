@@ -4,6 +4,11 @@ A 1.4B parameter (weight-tied; 1.71B untied) masked diffusion language model com
 quantization (ternary weights + hybrid 4-bit/8-bit activations) with an MDLM-style
 absorbing-state diffusion objective, quantized KV cache, and latent scratchpad thinking tokens.
 
+Three optional DiffusionGemma-style modes are available behind config flags
+(all **off by default**, so the baseline path is unchanged): uniform-state
+(random-token) diffusion, prediction self-conditioning, and adaptive block
+early-stopping. See [Experimental diffusion modes](#experimental-diffusion-modes).
+
 > **License:** Model weights are released under the BigCode OpenRAIL-M license.
 > Source code is Apache 2.0. See [LICENSE](LICENSE) for details.
 
@@ -14,6 +19,7 @@ absorbing-state diffusion objective, quantized KV cache, and latent scratchpad t
 | Property | BitDiffusion a4.8 | Standard LLM |
 |---|---|---|
 | Generation | Bidirectional masked diffusion | Left-to-right autoregressive |
+| Noise kernel | Absorbing `[MASK]` (default) or uniform random-token (opt-in) | — |
 | Weights | Ternary {−1, 0, +1} (BitNet b1.58) | float16 / bfloat16 |
 | Activations | INT4 inputs + TopK(55%) + INT8 intermediates | float16 |
 | KV Cache | 3-bit quantized (TurboQuant-style rotation) | float16 |
@@ -109,7 +115,10 @@ model.eval().pack_for_inference()  # one-time, before sampling
 
 - **Diffusion objective:** Masked absorbing-state diffusion (MDLM-style). Tokens
   are corrupted to a `[MASK]` absorbing state according to a cosine noise schedule.
-  The model is trained to denoise all masked positions simultaneously.
+  The model is trained to denoise all masked positions simultaneously. An opt-in
+  uniform-state kernel (`--noise_type uniform`) instead corrupts tokens to *random
+  vocabulary tokens* and re-noises low-confidence positions at sample time — see
+  [Experimental diffusion modes](#experimental-diffusion-modes).
 
 - **Positional encoding:** Rotary Position Embeddings (RoPE) with auto-extending
   cache. Supports `rope_offset` for correct positions in block diffusion.
@@ -327,6 +336,76 @@ python sample.py \
 | `--max_length` | 2048 | Hard cap for auto-length mode |
 | `--block` | False | Use block diffusion for long generation |
 | `--block_size` | 256 | Tokens per block |
+| `--noise_type` | `mask` | Diffusion kernel: `mask` (absorbing) or `uniform` (random-token) |
+| `--renoise_threshold` | 0.9 | Uniform mode: re-noise a token when its predicted prob drops below this |
+| `--use_self_cond` | False | Self-conditioning for legacy checkpoints (embedded configs set it automatically) |
+| `--early_stop` | False | Block mode: halt a block when entropy is low and predictions are stable |
+| `--entropy_threshold` | 0.5 | Mean per-position entropy (nats) below which a block is considered converged |
+
+---
+
+## Experimental diffusion modes
+
+Three optional modes ported from DiffusionGemma. All are **off by default and
+flag-gated**, so leaving them unset reproduces the baseline path bit-for-bit.
+They are fully compatible with the ternary-weight / quantization / packed-inference
+path — no `BitLinear`, KV-cache, or training-quantization code is changed; the
+self-conditioning projection is a small zero-initialised fp `Linear` (like the
+existing `t_proj`), and uniform noise only ever draws from the real vocabulary so
+the special-token embedding rows are untouched.
+
+> **Status: experimental.** These paths are implemented and flag-gated but not yet
+> benchmarked for quality. Treat them as A/B knobs to evaluate against the
+> default, not as proven improvements.
+
+### 1. Uniform-state diffusion
+
+Instead of corrupting tokens to a single `[MASK]` absorbing state, corrupt them to
+**random vocabulary tokens** (the same cosine schedule decides *which* positions).
+During sampling there is no mask sentinel — every position holds a real token, and
+any token whose predicted probability falls below `--renoise_threshold` is
+re-noised with a fresh random token as the surrounding context firms up, so the
+canvas keeps error-correcting.
+
+```bash
+# train with the uniform kernel
+python train.py --noise_type uniform
+
+# sample (full denoiser or block)
+python sample.py --checkpoint ckpt.pt --noise_type uniform --renoise_threshold 0.9 ...
+```
+
+### 2. Self-conditioning
+
+After each step the model's predicted probability distribution is multiplied by the
+token embedding table to form a per-position memory vector (`softmax(logits) @
+embed`), which is fed into the next step through a zero-initialised projection.
+Training uses the standard recipe (Chen et al. 2022): with probability 0.5 a step
+first predicts with no memory, builds the vector, then re-runs supervised on it
+(≈+50% forward cost on those steps); the other half trains the no-memory path so the
+first inference step stays in-distribution.
+
+```bash
+python train.py --use_self_cond True
+# Checkpoints record the flag, so sampling enables it automatically.
+python sample.py --checkpoint ckpt.pt ...
+```
+
+### 3. Multi-canvas block sampling + adaptive early stop
+
+Block diffusion (diffuse a fixed block → commit its K/V to the quantized cache →
+start a fresh canvas) already drives long-form generation. The new `--early_stop`
+flag halts a block's denoising as soon as it has converged: **mean per-position
+prediction entropy < `--entropy_threshold` (nats) AND two consecutive argmax
+predictions are identical**. Uniform-state and self-conditioning both apply inside
+the block loop when enabled.
+
+```bash
+python sample.py --checkpoint ckpt.pt \
+    --block --block_size 256 --steps 20 \
+    --early_stop --entropy_threshold 0.5 \
+    --prompt "Write a detailed explanation of" --length 2048
+```
 
 ---
 
@@ -493,15 +572,17 @@ throughput tables. Run the script on your hardware to validate.
 
 ```
 bitdiffusion/
-├── model.py          # BitLinear, BitAttention, BitFFN, BitMoEFFN, BitDiffusionTransformer
+├── model.py          # BitLinear, BitAttention, BitFFN, BitMoEFFN, BitDiffusionTransformer,
+│                     # self_cond_vector (self-conditioning helper)
 ├── rdt.py            # BitRDTTransformer — Recurrent-Depth Transformer variant
 ├── quantization.py   # HybridQuantizer, KVCache, TurboQuant rotation, absmax/TopK
 ├── kernels.py        # 2-bit pack/unpack, INT4×ternary Triton kernel + CPU fallback,
 │                     # grouped MoE-expert kernel, AOT compile probe
-├── diffusion.py      # CosineSchedule, MaskDiffusionLoss, masking utilities
+├── diffusion.py      # CosineSchedule, MaskDiffusionLoss, apply_mask / apply_uniform_noise
 ├── data.py           # StreamingJsonlDataset, variable-length chunking, DataLoader
 ├── train.py          # Training loop, TrainConfig, ActivationSchedule, main()
-├── sample.py         # ThinkingDiffusionSampler, BlockDiffusionSampler, auto-length
+├── sample.py         # ThinkingDiffusionSampler, BlockDiffusionSampler (uniform / self-cond /
+│                     # adaptive early-stop), auto-length
 ├── export.py         # Checkpoint export to safetensors / PyTorch (with --pack)
 └── utils.py          # BitStats, checkpoint save/load, logging, WandB wrapper
 
@@ -531,6 +612,98 @@ This repo trains a 1.4B model on a single A100 40GB for ~$200. To scale:
 
 Flash Attention (`F.scaled_dot_product_attention`) scales memory linearly with
 sequence length — compute, not VRAM, is the bottleneck at long context.
+
+---
+
+## Estimated Training Cost & Inference Footprint
+
+> **Estimates, not measurements.** Anchored to the real 1.4B run in this repo
+> (30.1B tokens on a single A100 40GB ≈ **$200**). Scaled by FLOPs, not run.
+> Ternary weights give **no training speedup** — the forward pass uses bf16
+> matmuls under straight-through estimation, so training compute is the usual
+> `C = 6 · N_active · D`. Ternary's win is entirely at **inference** (2-bit packed
+> weights). MoE (32B+) costs compute on *active* params but stores *all* experts.
+
+**Assumptions:** 20 tokens/param (Chinchilla-ish — diffusion may want more),
+40% MFU, H100 @ ~$2/hr rental. Spot/community A100s (~$0.4/hr) cut cash cost
+~2–3×; clusters cut wall-clock, not GPU-hours. Real diffusion LMs often need
+2–4× the tokens of an AR model for the same quality, so treat token counts as a
+floor.
+
+### Training cost
+
+| Model | Type | Active params | Train tokens | Compute (EFLOP) | GPU-hours (H100) | Est. cost |
+|---|---|---|---|---|---|---|
+| 500M | dense | 0.5B | 10B | 30 | ~20 | **~$40** |
+| 750M | dense | 0.75B | 15B | 68 | ~50 | **~$95** |
+| 1B | dense | 1B | 20B | 120 | ~85 | **~$170** |
+| 3B | dense | 3B | 60B | 1,080 | ~760 | **~$1.5K** |
+| 5B | dense | 5B | 100B | 3,000 | ~2,100 | **~$4.2K** |
+| 7B | dense | 7B | 140B | 5,880 | ~4,100 | **~$8.2K** |
+| 12B | dense | 12B | 240B | 17,280 | ~12,100 | **~$24K** |
+| 32B | MoE (8e/top-2, ~8B act) | 8B | 300B | 14,400 | ~10,100 | **~$20K** |
+| 70B | MoE (~12B act) | 12B | 500B | 36,000 | ~25,300 | **~$51K** |
+| 500B | MoE (~30B act) | 30B | 3T | 540,000 | ~379K | **~$760K** |
+| 1T | MoE (~50B act) | 50B | 6T | 1,800,000 | ~1.26M | **~$2.5M** |
+
+Wall-clock on a 1,024×H100 cluster: 12B ≈ 12h, 70B ≈ 1 day, 500B ≈ 2.2 weeks,
+1T ≈ 7+ weeks.
+
+### Inference footprint (packed 2-bit ternary, target ≥20 tok/s)
+
+Diffusion throughput is `tps = FLOPS_eff / (steps · 2 · N_active)` — block length
+cancels, so the sustained-compute floor for a target tps is **`20 · steps · 2 ·
+N_active`** (independent of how many tokens you emit). At the default `steps=20`
+that's `800 · N_active` FLOP/s. Raw-GPU column assumes ~30% inference MFU on the
+packed kernel.
+
+| Model | Weights (2-bit packed) | Weights (fp16 ref) | Compute floor @20 tps | Raw GPU @30% MFU | Bound by → min GPU |
+|---|---|---|---|---|---|
+| 500M | 0.13 GB | 1 GB | 0.4 TFLOPS | 1.3 TFLOPS | VRAM → edge/Jetson, CPU |
+| 750M | 0.19 GB | 2 GB | 0.6 TFLOPS | 2.0 TFLOPS | VRAM → edge, any iGPU |
+| 1B | 0.25 GB | 2 GB | 0.8 TFLOPS | 2.7 TFLOPS | VRAM → edge, any iGPU |
+| 3B | 0.75 GB | 6 GB | 2.4 TFLOPS | 8.0 TFLOPS | VRAM → 8GB GPU |
+| 5B | 1.25 GB | 10 GB | 4.0 TFLOPS | 13.3 TFLOPS | VRAM → 8GB GPU |
+| 7B | 1.75 GB | 14 GB | 5.6 TFLOPS | 18.7 TFLOPS | VRAM → 8GB GPU |
+| 12B | 3.0 GB | 24 GB | 9.6 TFLOPS | 32 TFLOPS | VRAM → 1× 12GB (3060) |
+| 32B MoE | 8.0 GB | 64 GB | 6.4 TFLOPS | 21 TFLOPS | VRAM → 1× 12GB |
+| 70B MoE | 17.5 GB | 140 GB | 9.6 TFLOPS | 32 TFLOPS | VRAM → 1× 24GB (4090) |
+| 500B MoE | 125 GB | 1,000 GB | 24 TFLOPS | 80 TFLOPS | VRAM → 2× 80GB |
+| 1T MoE | 250 GB | 2,000 GB | 40 TFLOPS | 133 TFLOPS | VRAM+compute → 4× 80GB |
+
+**The binding constraint at 20 tps is VRAM capacity, not compute.** Even the 1T
+MoE needs only ~40 TFLOPS of sustained math — a single 4090 (~165 TFLOPS peak)
+covers it; the 4 GPUs are there to *hold* the 250 GB of packed weights, not to do
+the math. Memory bandwidth is also comfortable: at a 256-token block, weights are
+re-read `steps` times, needing ~`0.39 · N_total` B/s ≈ 390 GB/s for the 1T model —
+well under one H100's 3.3 TB/s. Compute only becomes binding above ~50 tps or with
+large batches.
+
+To go faster, cut `steps` (linear: 10 steps → 2× tps, some quality loss) or batch
+requests (compute floor scales with batch, so batching is where the FLOPS column
+starts to matter). Add KV cache (3-bit): ~`n_layers · 2 · n_kv_heads · head_dim ·
+seq · 3/8` bytes — MBs at 4K context. Embeddings stay fp16 (`vocab · hidden · 2`
+≈ 0.6 GB) and dominate weight size at the small end.
+
+### How each might perform
+
+Capability is set by **active** params × tokens, not total — a 70B MoE reasons
+roughly like its ~12B dense-active core, just with broader knowledge.
+
+| Model | Expected capability |
+|---|---|
+| 500M–1B | Coherent short text, basic QA, simple completion. Repo's own tier. Edge/CPU viable. |
+| 3B–7B | Solid instruction-following, basic reasoning + code after SFT. Phi/Mistral-7B class. Single-GPU sweet spot. |
+| 12B | Strong general assistant, multi-step reasoning. Best dense quality-per-VRAM here (3 GB packed). |
+| 32B MoE | 12B-class reasoning + wider knowledge from 32B of experts. Fits a 4090 packed. |
+| 70B MoE | GPT-3.5-class general use; strong with good data. 17.5 GB packed = one A6000. |
+| 500B MoE | Frontier-adjacent if data/tokens scale. Multi-GPU, but packed weights make it ~8× cheaper to serve than fp16. |
+| 1T MoE | Frontier-scale ambition. Cost ($2.5M+) and 6T-token data pipeline are the real walls, not VRAM. |
+
+Diffusion-specific: bidirectional generation trades higher per-token compute
+(N denoising steps) for parallel decoding and infilling. Ternary + diffusion is
+unproven above ~10B publicly — quality at 32B+ is extrapolation, validate before
+committing budget.
 
 ---
 
@@ -607,6 +780,19 @@ sequence length — compute, not VRAM, is the bottleneck at long context.
 - **OpenMythos** — Gomez (2025).
   Recurrent-Depth Transformer. Basis for the `BitRDTTransformer` variant in `rdt.py`.
   [github.com/kyegomez/OpenMythos](https://github.com/kyegomez/OpenMythos)
+
+- **DiffusionGemma** — Google (2026).
+  Source of the three opt-in modes (uniform-state diffusion, self-conditioning,
+  multi-canvas block sampling) in [Experimental diffusion modes](#experimental-diffusion-modes).
+  [ai.google.dev/gemma/docs/diffusiongemma/explained](https://ai.google.dev/gemma/docs/diffusiongemma/explained)
+
+- **Self-conditioning (Analog Bits)** — Chen, Zhang, Hinton (2022).
+  *Analog Bits: Generating Discrete Data using Diffusion Models with Self-Conditioning.*
+  [arXiv:2208.04202](https://arxiv.org/abs/2208.04202) — the self-conditioning recipe used here.
+
+- **BD3-LM (Block Diffusion)** — Arriola et al. (2025).
+  *Block Diffusion: Interpolating Between Autoregressive and Diffusion Language Models.*
+  [arXiv:2503.09573](https://arxiv.org/abs/2503.09573) — semi-autoregressive block sampling.
 
 ---
 

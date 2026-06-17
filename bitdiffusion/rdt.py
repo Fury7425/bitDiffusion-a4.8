@@ -454,6 +454,10 @@ class BitRDTTransformer(nn.Module):
         self.embed_drop = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
         self.noise_embed = NoiseEmbedding(config.t_embed_dim)
 
+        # Self-conditioning projection (plain fp Linear, zero-initialised below).
+        if config.use_self_cond:
+            self.self_cond_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
+
         # Prelude blocks (run once)
         self.prelude = nn.ModuleList([
             BitBlock(config, layer_idx=i)
@@ -482,6 +486,11 @@ class BitRDTTransformer(nn.Module):
         # block) + coda. Use this as the scaling denominator.
         n_residual = config.prelude_layers + config.recurrent_layers + config.coda_layers
         self._scale_residual_init(n_residual)
+
+        # Zero-init self-cond projection so an enabled model starts identical
+        # to one without self-conditioning.
+        if config.use_self_cond:
+            nn.init.zeros_(self.self_cond_proj.weight)
 
         # Tie input embedding and unembedding head (see ModelConfig.tie_embeddings).
         # Both `embed.weight` and `unembed.weight` keys are still serialized,
@@ -530,6 +539,7 @@ class BitRDTTransformer(nn.Module):
         kv_cache: Optional[KVCache] = None,
         rope_offset: int = 0,
         n_loops: Optional[int] = None,
+        self_cond: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -542,6 +552,9 @@ class BitRDTTransformer(nn.Module):
                      uses max_loop_iters (eval) or a random count (train when
                      randomize_loops=True). Values > max_loop_iters enable
                      inference-time depth extrapolation.
+            self_cond: Optional (B, T, hidden) self-conditioning memory vector
+                       from the previous step. Only used when
+                       ``config.use_self_cond`` is True.
 
         Returns:
             Tuple of (logits, aux_loss). logits is (B, T, vocab_total);
@@ -555,6 +568,8 @@ class BitRDTTransformer(nn.Module):
                 n_loops = self.config.max_loop_iters
 
         x = self.embed(input_ids)
+        if self.config.use_self_cond and self_cond is not None:
+            x = x + self.self_cond_proj(self_cond)
         x = self.embed_drop(x)
         t_emb = self.noise_embed(t)
 

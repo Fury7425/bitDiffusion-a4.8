@@ -24,16 +24,17 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from .diffusion import CosineSchedule, ThinkingMaskSchedule
-from .model import BitDiffusionTransformer, ModelConfig
+from .model import BitDiffusionTransformer, ModelConfig, self_cond_vector
 from .quantization import KVCache
 from .utils import force_utf8_console, read_checkpoint, resolve_checkpoint_model_config, setup_logging
 
 
-def _model_fwd(model, ids, t, *, kv_cache=None, rope_offset=0, n_loops=None):
+def _model_fwd(model, ids, t, *, kv_cache=None, rope_offset=0, n_loops=None, self_cond=None):
     """Unified model forward that passes n_loops only to BitRDTTransformer."""
     if n_loops is not None and hasattr(model, "rdt_config"):
-        return model(ids, t, kv_cache=kv_cache, rope_offset=rope_offset, n_loops=n_loops)
-    return model(ids, t, kv_cache=kv_cache, rope_offset=rope_offset)
+        return model(ids, t, kv_cache=kv_cache, rope_offset=rope_offset,
+                     n_loops=n_loops, self_cond=self_cond)
+    return model(ids, t, kv_cache=kv_cache, rope_offset=rope_offset, self_cond=self_cond)
 
 logger = logging.getLogger("bitdiffusion")
 
@@ -61,6 +62,7 @@ def _build_model_config(args: argparse.Namespace, tokenizer) -> ModelConfig:
         t_embed_dim=args.t_embed_dim,
         kv_cache_bits=args.kv_cache_bits,
         kv_cache_bos_bits=args.kv_cache_bos_bits,
+        use_self_cond=args.use_self_cond,
         N_think=n_think,
         use_moe=args.use_moe,
         n_experts=args.n_experts,
@@ -180,6 +182,9 @@ def denoise(
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
     n_loops: Optional[int] = None,
+    noise_type: str = "mask",
+    renoise_threshold: float = 0.9,
+    use_self_cond: Optional[bool] = None,
 ) -> list[str]:
     """Generate text via iterative diffusion denoising.
 
@@ -224,18 +229,28 @@ def denoise(
     prefix_len = len(prompt_ids)
     total_len = max(gen_length, prefix_len + 1)
 
-    # Initialize: prompt prefix + fully masked remainder
+    # Initialize: prompt prefix + corrupted remainder. "mask" fills the
+    # remainder with the absorbing sentinel; "uniform" fills it with random
+    # real-vocabulary tokens (Uniform State Diffusion).
     ids = torch.full((num_samples, total_len), mask_token_id, dtype=torch.long, device=device)
     if prefix_len > 0:
         prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=device)
         ids[:, :prefix_len] = prompt_tensor
 
-    # Frozen mask: True where tokens should never be masked (the prompt)
+    # Frozen mask: True where tokens should never be corrupted (the prompt)
     frozen = torch.zeros(num_samples, total_len, dtype=torch.bool, device=device)
     if prefix_len > 0:
         frozen[:, :prefix_len] = True
 
     gen = torch.Generator(device=device).manual_seed(seed)
+
+    if noise_type == "uniform" and (~frozen).any():
+        rand_init = torch.randint(0, vocab_size, (num_samples, total_len), device=device, generator=gen)
+        ids = torch.where(frozen, ids, rand_init)
+
+    # Self-conditioning: carry the previous step's prediction memory forward.
+    use_sc = getattr(model.config, "use_self_cond", False) if use_self_cond is None else use_self_cond
+    self_cond = None
 
     # Denoising schedule: linearly spaced from t=1 to t=0
     t_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)
@@ -246,34 +261,64 @@ def denoise(
 
         # Forward pass — no KV cache; each step reprocesses the full sequence.
         t_input = t_curr.expand(num_samples)
-        logits, _ = _model_fwd(model, ids, t_input, n_loops=n_loops)  # (B, T, V)
+        logits, _ = _model_fwd(model, ids, t_input, n_loops=n_loops, self_cond=self_cond)  # (B, T, V)
 
-        # Identify currently masked positions (excluding frozen prefix)
-        is_masked = (ids == mask_token_id)
+        # Memory of this step's prediction for the next step.
+        if use_sc:
+            self_cond = self_cond_vector(logits, model.embed.weight, vocab_size)
 
-        # Sample at all masked positions (batched)
-        if is_masked.any():
-            masked_logits = logits[:, :, :vocab_size]  # (B, T, V) exclude mask token
-            masked_logits = masked_logits / max(temperature, 1e-8)
+        if noise_type == "uniform":
+            # Uniform State Diffusion: no absorbing sentinel to detect — every
+            # non-frozen position holds a real token. Predict everywhere, commit
+            # the new prediction, then re-noise positions whose predicted
+            # probability fell below ``renoise_threshold`` (context changed and
+            # the token is no longer confident) with a fresh random token.
+            cand_logits = logits[:, :, :vocab_size] / max(temperature, 1e-8)
             if top_p < 1.0:
-                sorted_logits, sorted_idx = masked_logits.sort(dim=-1, descending=True)
+                sorted_logits, sorted_idx = cand_logits.sort(dim=-1, descending=True)
                 cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
                 remove_mask = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
                 sorted_logits[remove_mask] = -float("inf")
-                filtered = torch.full_like(masked_logits, float("-inf"))
+                filtered = torch.full_like(cand_logits, float("-inf"))
                 filtered.scatter_(-1, sorted_idx, sorted_logits)
-                masked_logits = filtered
-            probs = F.softmax(masked_logits, dim=-1)
+                cand_logits = filtered
+            probs = F.softmax(cand_logits, dim=-1)
             flat_probs = probs.view(-1, probs.shape[-1])
             sampled = torch.multinomial(flat_probs, 1, generator=gen).view(num_samples, total_len)
-            ids = torch.where(is_masked, sampled, ids)
+            pred_prob = flat_probs.gather(-1, sampled.view(-1, 1)).view(num_samples, total_len)
 
-        # Re-mask positions that should still be uncertain at t_next
-        if t_next > 0:
-            mask_prob_next = schedule.mask_prob(t_next)
-            rand = torch.rand(num_samples, total_len, device=device, generator=gen)
-            should_remask = (rand < mask_prob_next) & ~frozen
-            ids[should_remask] = mask_token_id
+            ids = torch.where(frozen, ids, sampled)
+            if t_next > 0:
+                rand_tokens = torch.randint(0, vocab_size, (num_samples, total_len), device=device, generator=gen)
+                low_conf = (pred_prob < renoise_threshold) & ~frozen
+                ids = torch.where(low_conf, rand_tokens, ids)
+        else:
+            # Identify currently masked positions (excluding frozen prefix)
+            is_masked = (ids == mask_token_id)
+
+            # Sample at all masked positions (batched)
+            if is_masked.any():
+                masked_logits = logits[:, :, :vocab_size]  # (B, T, V) exclude mask token
+                masked_logits = masked_logits / max(temperature, 1e-8)
+                if top_p < 1.0:
+                    sorted_logits, sorted_idx = masked_logits.sort(dim=-1, descending=True)
+                    cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                    remove_mask = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
+                    sorted_logits[remove_mask] = -float("inf")
+                    filtered = torch.full_like(masked_logits, float("-inf"))
+                    filtered.scatter_(-1, sorted_idx, sorted_logits)
+                    masked_logits = filtered
+                probs = F.softmax(masked_logits, dim=-1)
+                flat_probs = probs.view(-1, probs.shape[-1])
+                sampled = torch.multinomial(flat_probs, 1, generator=gen).view(num_samples, total_len)
+                ids = torch.where(is_masked, sampled, ids)
+
+            # Re-mask positions that should still be uncertain at t_next
+            if t_next > 0:
+                mask_prob_next = schedule.mask_prob(t_next)
+                rand = torch.rand(num_samples, total_len, device=device, generator=gen)
+                should_remask = (rand < mask_prob_next) & ~frozen
+                ids[should_remask] = mask_token_id
 
         if verbose:
             # Print intermediate result
@@ -630,6 +675,11 @@ class BlockDiffusionSampler:
         auto_length: bool = False,
         max_length: int = 2048,
         n_loops: Optional[int] = None,
+        noise_type: str = "mask",
+        renoise_threshold: float = 0.9,
+        early_stop: bool = False,
+        entropy_threshold: float = 0.5,
+        use_self_cond: Optional[bool] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -645,6 +695,17 @@ class BlockDiffusionSampler:
         self.auto_length = auto_length
         self.max_length = max_length
         self.n_loops = n_loops
+        self.noise_type = noise_type
+        self.renoise_threshold = renoise_threshold
+        self.early_stop = early_stop
+        # Entropy threshold is in NATS (natural-log entropy of the per-position
+        # predicted distribution, averaged over the block).
+        self.entropy_threshold = entropy_threshold
+        # None → read model.config.use_self_cond; bool → force on/off.
+        self.use_self_cond = (
+            getattr(model.config, "use_self_cond", False)
+            if use_self_cond is None else use_self_cond
+        )
         # Resolve EOS token ID from tokenizer
         self.eos_token_id: Optional[int] = getattr(tokenizer, "eos_token_id", None)
 
@@ -673,6 +734,30 @@ class BlockDiffusionSampler:
         sampled = torch.multinomial(probs.view(-1, V), 1, generator=gen).view(B, T)
         return torch.where(is_masked, sampled, ids)
 
+    def _sample_uniform(
+        self,
+        logits: torch.Tensor,
+        gen: torch.Generator,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Uniform-mode sampling: return ``(sampled_ids, pred_prob)`` for every
+        position (batched, temperature + optional top-p)."""
+        vocab_size = self.model.config.vocab_size
+        cand = logits[:, :, :vocab_size] / max(self.temperature, 1e-8)
+        if self.top_p < 1.0:
+            sorted_logits, sorted_idx = cand.sort(dim=-1, descending=True)
+            cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            remove = cumprobs - sorted_logits.softmax(dim=-1) >= self.top_p
+            sorted_logits[remove] = -float("inf")
+            filtered = torch.full_like(cand, float("-inf"))
+            filtered.scatter_(-1, sorted_idx, sorted_logits)
+            cand = filtered
+        probs = F.softmax(cand, dim=-1)
+        B, T, V = probs.shape
+        flat = probs.view(-1, V)
+        sampled = torch.multinomial(flat, 1, generator=gen).view(B, T)
+        pred_prob = flat.gather(-1, sampled.view(-1, 1)).view(B, T)
+        return sampled, pred_prob
+
     def _denoise_block(
         self,
         block_ids: torch.Tensor,
@@ -699,9 +784,19 @@ class BlockDiffusionSampler:
         """
         schedule = CosineSchedule()
         mask_token_id = self.model.config.mask_token_id
+        vocab_size = self.model.config.vocab_size
         B, block_len = block_ids.shape
 
+        # Uniform canvas: replace the masked placeholder with random real tokens.
+        if self.noise_type == "uniform":
+            block_ids = torch.randint(
+                0, vocab_size, (B, block_len), device=self.device, generator=gen
+            )
+
         t_steps = torch.linspace(1.0, 0.0, n_steps + 1, device=self.device)
+
+        self_cond = None       # self-conditioning memory across steps
+        prev_pred = None       # previous-step argmax for the stability check
 
         kv_cache.ephemeral = True
         for step_idx in range(n_steps):
@@ -711,28 +806,66 @@ class BlockDiffusionSampler:
             t_input = t_curr.expand(B)
             logits, _ = _model_fwd(self.model, block_ids, t_input,
                                    kv_cache=kv_cache, rope_offset=rope_offset,
-                                   n_loops=self.n_loops)
+                                   n_loops=self.n_loops, self_cond=self_cond)
 
-            is_masked = (block_ids == mask_token_id)
-            block_ids = self._sample_masked(logits, is_masked, block_ids, gen)
+            vocab_logits = logits[:, :, :vocab_size]
 
-            # Re-mask positions for next step
-            if t_next > 0:
-                mask_prob = schedule.mask_prob(t_next)
-                rand = torch.rand(B, block_len, device=self.device, generator=gen)
-                should_remask = rand < mask_prob
-                block_ids = torch.where(should_remask & is_masked, mask_token_id, block_ids)
+            # Early-stop bookkeeping: mean per-position entropy (nats) + argmax.
+            if self.early_stop:
+                es_probs = F.softmax(vocab_logits.float(), dim=-1)
+                entropy = (-(es_probs * es_probs.clamp_min(1e-12).log()).sum(-1)).mean()
+                cur_pred = vocab_logits.argmax(dim=-1)
+
+            # Sample + re-noise for the next step.
+            if self.noise_type == "uniform":
+                sampled, pred_prob = self._sample_uniform(logits, gen)
+                block_ids = sampled
+                if t_next > 0:
+                    rand_tokens = torch.randint(
+                        0, vocab_size, (B, block_len), device=self.device, generator=gen
+                    )
+                    low_conf = pred_prob < self.renoise_threshold
+                    block_ids = torch.where(low_conf, rand_tokens, block_ids)
+            else:
+                is_masked = (block_ids == mask_token_id)
+                block_ids = self._sample_masked(logits, is_masked, block_ids, gen)
+                if t_next > 0:
+                    mask_prob = schedule.mask_prob(t_next)
+                    rand = torch.rand(B, block_len, device=self.device, generator=gen)
+                    should_remask = rand < mask_prob
+                    block_ids = torch.where(should_remask & is_masked, mask_token_id, block_ids)
+
+            # Self-conditioning memory for the next step.
+            if self.use_self_cond:
+                self_cond = self_cond_vector(logits, self.model.embed.weight, vocab_size)
 
             if self.verbose:
                 n_masked = (block_ids == mask_token_id).sum().item()
                 preview = self.tokenizer.decode(
-                    block_ids[0].clamp(0, self.model.config.vocab_size - 1).tolist(),
+                    block_ids[0].clamp(0, vocab_size - 1).tolist(),
                     skip_special_tokens=True,
                 )
+                extra = f", H={float(entropy):.3f}" if self.early_stop else ""
                 logger.info(
-                    "  step %d/%d (t=%.3f→%.3f, masked=%d): %s",
-                    step_idx + 1, n_steps, t_curr.item(), t_next.item(), n_masked, preview[:120],
+                    "  step %d/%d (t=%.3f→%.3f, masked=%d%s): %s",
+                    step_idx + 1, n_steps, t_curr.item(), t_next.item(), n_masked, extra, preview[:120],
                 )
+
+            # Adaptive early stopping: halt when mean entropy is below the
+            # threshold AND two consecutive argmax predictions are identical.
+            if self.early_stop:
+                if (
+                    prev_pred is not None
+                    and float(entropy) < self.entropy_threshold
+                    and torch.equal(cur_pred, prev_pred)
+                ):
+                    if self.verbose:
+                        logger.info(
+                            "  [early_stop] converged at step %d/%d (H=%.3f < %.3f, preds stable)",
+                            step_idx + 1, n_steps, float(entropy), self.entropy_threshold,
+                        )
+                    break
+                prev_pred = cur_pred
 
         kv_cache.ephemeral = False
         return block_ids
@@ -942,6 +1075,19 @@ def main() -> None:
     parser.add_argument("--prompt", type=str, default="", help="Conditioning prompt prefix")
     parser.add_argument("--length", type=int, default=128, help="Total sequence length")
     parser.add_argument("--steps", type=int, default=20, help="Number of denoising steps")
+    parser.add_argument(
+        "--noise_type", type=str, default="mask", choices=("mask", "uniform"),
+        help="Diffusion noise kernel: 'mask' (absorbing) or 'uniform' (random-token, DiffusionGemma).",
+    )
+    parser.add_argument(
+        "--renoise_threshold", type=float, default=0.9,
+        help="Uniform mode: re-noise a token when its predicted probability drops below this.",
+    )
+    parser.add_argument(
+        "--use_self_cond", action="store_true",
+        help="Self-conditioning for legacy checkpoints without embedded model_config "
+             "(checkpoints carrying a config set this automatically).",
+    )
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.95, help="Nucleus sampling threshold")
     parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to generate")
@@ -991,6 +1137,15 @@ def main() -> None:
         help="Stop generating when EOS token appears — model decides response length automatically")
     parser.add_argument("--max_length", type=int, default=2048,
         help="Hard cap on total tokens when --auto_length is enabled")
+    parser.add_argument(
+        "--early_stop", action="store_true",
+        help="Block diffusion: halt a block's denoising early when mean prediction "
+             "entropy < --entropy_threshold AND two consecutive predictions match.",
+    )
+    parser.add_argument(
+        "--entropy_threshold", type=float, default=0.5,
+        help="Mean per-position entropy (nats) below which a block is considered converged.",
+    )
 
     # RDT args
     parser.add_argument(
@@ -1052,6 +1207,10 @@ def main() -> None:
             seed=args.seed,
             device=device,
             n_loops=args.n_loops,
+            noise_type=args.noise_type,
+            renoise_threshold=args.renoise_threshold,
+            early_stop=args.early_stop,
+            entropy_threshold=args.entropy_threshold,
         )
         t0 = time.perf_counter()
         results = sampler.generate(
@@ -1138,6 +1297,8 @@ def main() -> None:
             seed=args.seed,
             device=device,
             n_loops=args.n_loops,
+            noise_type=args.noise_type,
+            renoise_threshold=args.renoise_threshold,
         )
         wall_s = time.perf_counter() - t0
         n_tokens = args.num_samples * args.length

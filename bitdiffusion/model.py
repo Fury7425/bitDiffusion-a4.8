@@ -33,6 +33,42 @@ from .quantization import HybridQuantizer, KVCache, absmax_quantize_int8, absmea
 
 
 # ---------------------------------------------------------------------------
+# Self-conditioning helper
+# ---------------------------------------------------------------------------
+
+def self_cond_vector(
+    logits: torch.Tensor,
+    embed_weight: torch.Tensor,
+    vocab_size: int,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Self-conditioning memory vector (DiffusionGemma / Chen et al. 2022).
+
+    Multiplies the predicted probability distribution over the *real*
+    vocabulary by the token embedding table, producing a per-position vector
+    that carries a memory of the prior step's predictions and their confidence::
+
+        z = softmax(logits[..., :vocab]) @ embed_weight[:vocab]   # (B, T, hidden)
+
+    Returned detached — the signal is a constant input to the next step
+    (stop-gradient), matching the standard self-conditioning recipe.
+
+    Args:
+        logits: (B, T, vocab_total) model logits from the previous step.
+        embed_weight: (vocab_total, hidden) token embedding table.
+        vocab_size: Real vocabulary size; special-token rows are excluded so
+                    the memory vector never carries mask/think embeddings.
+        temperature: Softmax temperature for the probability distribution.
+
+    Returns:
+        (B, T, hidden) detached conditioning vector.
+    """
+    probs = torch.softmax(logits[..., :vocab_size].float() / max(temperature, 1e-8), dim=-1)
+    z = probs.to(embed_weight.dtype) @ embed_weight[:vocab_size]
+    return z.detach()
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -90,6 +126,14 @@ class ModelConfig:
     moe_layers: str = "alternate"  # "all", "alternate", "alternate_even", "top_half"
     aux_loss_weight: float = 0.01
     expert_capacity_factor: float = 1.25
+
+    # --- Self-conditioning ---
+    # When True, the model accepts an optional (B, T, hidden) memory vector
+    # built from the previous step's predicted distribution (see
+    # ``self_cond_vector``) and adds it, through a zero-initialised fp
+    # projection, to the token embeddings. Default off → bit-identical to the
+    # legacy single-pass forward. A/B by flipping this flag.
+    use_self_cond: bool = False
 
     # --- Recurrent-Depth Transformer (OpenMythos integration) ---
     use_rdt: bool = False  # discriminator for checkpoint topology validation
@@ -979,6 +1023,12 @@ class BitDiffusionTransformer(nn.Module):
         # Noise level embedding
         self.noise_embed = NoiseEmbedding(config.t_embed_dim)
 
+        # Self-conditioning projection (plain fp Linear, zero-initialised below
+        # so it starts as a no-op). Only created when enabled so legacy
+        # checkpoints round-trip with no extra keys.
+        if config.use_self_cond:
+            self.self_cond_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
+
         # Transformer blocks
         self.blocks = nn.ModuleList([
             BitBlock(config, layer_idx=i) for i in range(config.n_layers)
@@ -995,6 +1045,11 @@ class BitDiffusionTransformer(nn.Module):
 
         self.apply(self._init_weights)
         self._scale_residual_init(config.n_layers)
+
+        # Zero-init the self-cond projection so an enabled model starts
+        # identical to one without self-conditioning, then learns to use it.
+        if config.use_self_cond:
+            nn.init.zeros_(self.self_cond_proj.weight)
 
         # Tie input embedding and unembedding head into one shared weight.
         # Done after init so the shared tensor carries the embedding's init.
@@ -1059,6 +1114,7 @@ class BitDiffusionTransformer(nn.Module):
         t: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
         rope_offset: int = 0,
+        self_cond: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -1069,6 +1125,10 @@ class BitDiffusionTransformer(nn.Module):
             rope_offset: Position offset for RoPE (used in block diffusion
                          to give correct absolute positions when forwarding
                          only a subsequence).
+            self_cond: Optional (B, T, hidden) self-conditioning memory vector
+                       from the previous step (see ``self_cond_vector``). Only
+                       used when ``config.use_self_cond`` is True; None is
+                       treated as a zero signal (the no-self-cond pass).
 
         Returns:
             Tuple of (logits, aux_loss) where logits is (B, T, V) and
@@ -1076,6 +1136,8 @@ class BitDiffusionTransformer(nn.Module):
             no MoE layers are used).
         """
         x = self.embed(input_ids)
+        if self.config.use_self_cond and self_cond is not None:
+            x = x + self.self_cond_proj(self_cond)
         x = self.embed_drop(x)
 
         t_emb = self.noise_embed(t)  # (B, t_embed_dim)

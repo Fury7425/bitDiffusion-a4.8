@@ -93,6 +93,57 @@ def apply_mask(
     return masked_ids, is_masked
 
 
+def apply_uniform_noise(
+    token_ids: torch.Tensor,
+    t: torch.Tensor,
+    vocab_size: int,
+    schedule: CosineSchedule,
+    frozen_mask: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply uniform-state (random-token) noise to a batch of sequences.
+
+    Uniform State Diffusion (DiffusionGemma style): instead of swapping a
+    corrupted token for a single absorbing ``[MASK]`` sentinel, swap it for a
+    *random token drawn uniformly from the real vocabulary* ``[0, vocab_size)``.
+    The corruption probability per position is the same cosine schedule used by
+    :func:`apply_mask`, so a drop-in ``noise_type="uniform"`` swap keeps the
+    training timestep distribution and the MDLM loss weighting unchanged.
+
+    Unlike masking there is no sentinel to detect at sample time — every
+    position always holds a real token, and the sampler decides what to
+    re-noise from prediction confidence instead of a ``== mask_token_id`` test.
+
+    Args:
+        token_ids: (B, T) tensor of original token IDs.
+        t: (B,) tensor of noise levels per sample, each in [0, 1].
+        vocab_size: Size of the real vocabulary; random tokens are drawn from
+                    ``[0, vocab_size)`` (special tokens are never injected).
+        schedule: CosineSchedule instance.
+        frozen_mask: Optional (B, T) bool tensor. True positions are never
+                     corrupted (e.g., prompt prefix).
+
+    Returns:
+        (noised_ids, is_corrupted): ``noised_ids`` has some tokens replaced
+        with random vocabulary tokens; ``is_corrupted`` is a bool tensor of
+        the same shape marking which positions were corrupted (it plays the
+        same role as ``is_masked`` in the loss).
+    """
+    B, T = token_ids.shape
+    corrupt_prob = schedule.mask_prob(t)  # (B,) — reuse the cosine schedule
+    rand = torch.rand(B, T, device=token_ids.device)
+    is_corrupted = rand < corrupt_prob.unsqueeze(1)  # (B, T)
+
+    if frozen_mask is not None:
+        is_corrupted = is_corrupted & ~frozen_mask
+
+    noised_ids = token_ids.clone()
+    random_tokens = torch.randint(
+        0, vocab_size, (B, T), device=token_ids.device, dtype=token_ids.dtype
+    )
+    noised_ids[is_corrupted] = random_tokens[is_corrupted]
+    return noised_ids, is_corrupted
+
+
 class ThinkingMaskSchedule:
     """Dual-phase masking schedule for thinking token diffusion.
 

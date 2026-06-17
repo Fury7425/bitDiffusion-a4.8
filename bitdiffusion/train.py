@@ -51,8 +51,10 @@ class _NoOpScaler:
     def update(self) -> None: pass
 
 from .data import make_dataloader, make_litdata_dataloader, make_pretokenized_dataloader
-from .diffusion import CosineSchedule, MaskDiffusionLoss, ThinkingMaskSchedule, apply_mask
-from .model import BitDiffusionTransformer, ModelConfig
+from .diffusion import (
+    CosineSchedule, MaskDiffusionLoss, ThinkingMaskSchedule, apply_mask, apply_uniform_noise,
+)
+from .model import BitDiffusionTransformer, ModelConfig, self_cond_vector
 from .muon import Muon, split_params_for_muon
 from .quantization import KVCache
 from .utils import (
@@ -135,6 +137,18 @@ class TrainConfig:
     # mean cross-entropy over masked positions (legacy behaviour).
     loss_weighting: str = "mdlm"
     loss_t_min: float = 1e-3        # clamp t away from 0 to bound the MDLM weight
+    # Noise injection kernel: "mask" = absorbing-state masking (legacy, default,
+    # bit-identical); "uniform" = Uniform State Diffusion (corrupt tokens by
+    # swapping for random REAL vocabulary tokens, DiffusionGemma style). Uniform
+    # reuses the same cosine schedule + MDLM loss weighting, so only the
+    # corruption op changes. A/B by flipping this flag.
+    noise_type: str = "mask"        # "mask" | "uniform"
+    # Self-conditioning (DiffusionGemma / Chen 2022). When True, with prob 0.5
+    # each step the model first predicts with no self-cond (no-grad), builds a
+    # memory vector from that distribution, and re-runs with it; the supervised
+    # forward is the second pass. Adds ~50% forward cost on half the steps.
+    # Default off → bit-identical to legacy single-pass training.
+    use_self_cond: bool = False
     save_every: int = 2500
     val_every: int = 500
     bitstats_every: int = 250
@@ -470,6 +484,29 @@ def _build_optimizer_and_scheduler(
 
 
 # ---------------------------------------------------------------------------
+# Noise dispatch — mask (legacy) vs uniform (random-token) corruption
+# ---------------------------------------------------------------------------
+
+def _apply_noise(
+    input_ids: torch.Tensor,
+    t: torch.Tensor,
+    mask_token_id: int,
+    vocab_size: int,
+    schedule: CosineSchedule,
+    noise_type: str,
+    frozen_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Corrupt ``input_ids`` with the configured kernel.
+
+    Returns ``(noised_ids, is_corrupted)``; ``is_corrupted`` plays the role of
+    ``is_masked`` in the loss either way, so downstream code is unchanged.
+    """
+    if noise_type == "uniform":
+        return apply_uniform_noise(input_ids, t, vocab_size, schedule, frozen_mask=frozen_mask)
+    return apply_mask(input_ids, t, mask_token_id, schedule, frozen_mask=frozen_mask)
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -483,6 +520,8 @@ def validate(
     device: torch.device,
     max_batches: int = 50,
     amp_dtype: torch.dtype = torch.bfloat16,
+    noise_type: str = "mask",
+    vocab_size: int = 0,
 ) -> float:
     """Run validation and return average loss.
 
@@ -513,9 +552,10 @@ def validate(
             B, T = input_ids.shape
 
             t = torch.rand(B, device=device)
-            # Exclude padded positions from masking and loss
-            masked_ids, is_masked = apply_mask(
-                input_ids, t, mask_token_id, schedule, frozen_mask=~attention_mask
+            # Exclude padded positions from corruption and loss
+            masked_ids, is_masked = _apply_noise(
+                input_ids, t, mask_token_id, vocab_size, schedule, noise_type,
+                frozen_mask=~attention_mask,
             )
 
             with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
@@ -545,6 +585,8 @@ def generate_sample(
     steps: int = 10,
     temperature: float = 0.9,
     seed: int = 42,
+    noise_type: str = "mask",
+    renoise_threshold: float = 0.9,
 ) -> str:
     """Generate a sample using diffusion denoising for qualitative monitoring.
 
@@ -566,9 +608,13 @@ def generate_sample(
     try:
         gen = torch.Generator(device=device).manual_seed(seed)
         schedule = CosineSchedule()
+        vocab_size = model.config.vocab_size
 
-        # Start fully masked
-        ids = torch.full((1, seq_len), mask_token_id, dtype=torch.long, device=device)
+        # Initial canvas: fully masked (absorbing) or fully random (uniform).
+        if noise_type == "uniform":
+            ids = torch.randint(0, vocab_size, (1, seq_len), device=device, generator=gen)
+        else:
+            ids = torch.full((1, seq_len), mask_token_id, dtype=torch.long, device=device)
 
         t_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)
 
@@ -579,27 +625,40 @@ def generate_sample(
             t_input = t_curr.unsqueeze(0)  # (1,)
             logits, _ = model(ids, t_input)  # (1, T, V)
 
-            # Sample at masked positions — slice to normal vocab only so that
-            # special tokens (mask, think) cannot be sampled and silently clamped.
-            is_masked = (ids == mask_token_id)
-            probs = torch.softmax(logits[:, :, :model.config.vocab_size] / temperature, dim=-1)
-
-            # Sample from distribution
+            # Slice to normal vocab only so special tokens (mask, think) cannot
+            # be sampled and silently clamped.
+            probs = torch.softmax(logits[:, :, :vocab_size] / temperature, dim=-1)
             flat_probs = probs.view(-1, probs.shape[-1])
             sampled = torch.multinomial(flat_probs, 1, generator=gen).view(1, seq_len)
 
-            # Unmask: place sampled tokens at masked positions
-            ids = torch.where(is_masked, sampled, ids)
+            if noise_type == "uniform":
+                # Uniform State Diffusion: every position holds a real token, so
+                # commit the new prediction everywhere, then re-noise the
+                # low-confidence positions (predicted prob < threshold) with a
+                # fresh random token — the error-correcting canvas.
+                pred_prob = probs.view(-1, probs.shape[-1]).gather(
+                    -1, sampled.view(-1, 1)
+                ).view(1, seq_len)
+                ids = sampled
+                if t_next > 0:
+                    low_conf = pred_prob < renoise_threshold
+                    rand_tokens = torch.randint(
+                        0, vocab_size, (1, seq_len), device=device, generator=gen
+                    )
+                    ids = torch.where(low_conf, rand_tokens, ids)
+            else:
+                # Masked absorbing-state: unmask sampled tokens, re-mask the
+                # positions that should still be uncertain at t_next.
+                is_masked = (ids == mask_token_id)
+                ids = torch.where(is_masked, sampled, ids)
+                if t_next > 0:
+                    mask_prob_next = schedule.mask_prob(t_next)
+                    rand = torch.rand(1, seq_len, device=device, generator=gen)
+                    should_remask = rand < mask_prob_next
+                    ids = torch.where(should_remask & is_masked, mask_token_id, ids)
 
-            # Re-mask positions that should still be uncertain at t_next
-            if t_next > 0:
-                mask_prob_next = schedule.mask_prob(t_next)
-                rand = torch.rand(1, seq_len, device=device, generator=gen)
-                should_remask = rand < mask_prob_next
-                ids = torch.where(should_remask & is_masked, mask_token_id, ids)
-
-        # Decode — replace any remaining mask tokens
-        ids = ids.clamp(0, model.config.vocab_size - 1)
+        # Decode — clamp guards any residual special-token id.
+        ids = ids.clamp(0, vocab_size - 1)
         text = tokenizer.decode(ids[0].tolist(), skip_special_tokens=True)
     finally:
         if was_training:
@@ -704,6 +763,7 @@ def train(cfg: TrainConfig) -> None:
         kv_cache_bits=cfg.kv_cache_bits,
         kv_cache_bos_bits=cfg.kv_cache_bos_bits,
         tie_embeddings=cfg.tie_embeddings,
+        use_self_cond=cfg.use_self_cond,
         N_think=cfg.N_think,
         think_prob=cfg.think_prob,
         use_moe=cfg.use_moe,
@@ -890,15 +950,25 @@ def train(cfg: TrainConfig) -> None:
                 think_attn = torch.ones(B, model_cfg.N_think, dtype=torch.bool, device=device)
                 attention_mask = torch.cat([think_attn, attention_mask], dim=1)
 
-            # Mask — exclude padded positions from corruption
-            masked_ids, is_masked = apply_mask(
-                input_ids, t, mask_token_id, schedule, frozen_mask=~attention_mask
+            # Corrupt — exclude padded positions. Kernel selected by cfg.noise_type.
+            masked_ids, is_masked = _apply_noise(
+                input_ids, t, mask_token_id, vocab_size, schedule, cfg.noise_type,
+                frozen_mask=~attention_mask,
             )
             running_masked_frac += is_masked.float().mean().item() / cfg.grad_accum_steps
 
             # Forward
             with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                logits, aux_loss = model(masked_ids, t)
+                # Self-conditioning (Chen 2022): with prob 0.5, predict once
+                # with no self-cond (no-grad) and build the memory vector; the
+                # supervised pass below consumes it. The other 50% trains the
+                # no-self-cond path so inference's first step stays in-distribution.
+                self_cond = None
+                if model_cfg.use_self_cond and torch.rand(1).item() < 0.5:
+                    with torch.no_grad():
+                        prev_logits, _ = model(masked_ids, t)
+                        self_cond = self_cond_vector(prev_logits, model.embed.weight, vocab_size)
+                logits, aux_loss = model(masked_ids, t, self_cond=self_cond)
                 diffusion_loss = loss_fn(logits, input_ids, is_masked, is_think=is_think, t=t)
                 # Total loss: diffusion + MoE load balance
                 moe_loss = aux_loss * model_cfg.aux_loss_weight if model_cfg.use_moe else 0.0
@@ -987,6 +1057,7 @@ def train(cfg: TrainConfig) -> None:
                 val_loss = validate(
                     model, val_loader, loss_fn, schedule, mask_token_id, device,
                     max_batches=cfg.val_max_batches, amp_dtype=amp_dtype,
+                    noise_type=cfg.noise_type, vocab_size=vocab_size,
                 )
                 logger.info("step=%d  val_loss=%.4f", global_step, val_loss)
                 wandb_logger.log({"val/loss": val_loss}, step=global_step)
@@ -995,6 +1066,7 @@ def train(cfg: TrainConfig) -> None:
                 sample_text = generate_sample(
                     model, tokenizer, mask_token_id, device,
                     seq_len=min(64, cfg.max_seq_len), steps=10, seed=cfg.seed,
+                    noise_type=cfg.noise_type,
                 )
                 logger.info("Sample generation:\n%s", sample_text)
                 wandb_logger.log({"val/sample": sample_text}, step=global_step)
