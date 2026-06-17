@@ -37,7 +37,7 @@ cfgs = {
     "rdt": RDTConfig(vocab_size=V, hidden_dim=32, n_heads=2, ffn_dim=64,
                      max_seq_len=32, mask_token_id=V, use_rdt=True,
                      prelude_layers=1, recurrent_layers=1, coda_layers=1,
-                     max_loop_iters=2),
+                     max_loop_iters=2, loop_dim=16),  # loop_dim <= hidden_dim
 }
 
 for name, cfg in cfgs.items():
